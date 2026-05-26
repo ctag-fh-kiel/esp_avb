@@ -2084,6 +2084,12 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   state->stream_in_active = true;
   state->input_streams[index].connected = true;
 
+  /* Per-packet gPTP logging over UART blocks time-critical receive servicing
+   * once the 8 kHz audio stream is active. Keep aggregate AVB diagnostics,
+   * but silence chatty driver/PTP tags while receiving media. */
+  esp_log_level_set("ptpd", ESP_LOG_NONE);
+  esp_log_level_set("esp.emac", ESP_LOG_NONE);
+
   /* Register the shared dispatcher — routes to audio stream input or CRF by stream_id */
   avb_net_set_stream_rx_handler(avb_stream_rx_dispatcher, NULL);
 
