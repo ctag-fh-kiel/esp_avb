@@ -97,9 +97,10 @@ esp_err_t ak4619_configure(avb_state_s *state, i2c_master_bus_handle_t bus) {
   ESP_RETURN_ON_ERROR(ak4619_write(REG_AUDIO_IF1, 0x1C), TAG, "Audio IF1");
   ESP_RETURN_ON_ERROR(ak4619_write(REG_SYSCLK, 0x02), TAG, "MCLK 384fs");
   ESP_RETURN_ON_ERROR(ak4619_write(REG_ADC_IN_SEL, 0x55), TAG, "ADC inputs");
-  /* In TDM mode the multiplexed input is SDIN1. DAC2 defaults to SDIN2,
-   * which is ignored in TDM mode; route both DAC banks from SDIN1. */
-  ESP_RETURN_ON_ERROR(ak4619_write(REG_DAC_INPUT_SEL, 0x00), TAG,
+  /* Preserve the documented DAC pair selection. In TDM mode SDIN1 carries
+   * four ordered slots (DAC1 L/R then DAC2 L/R); selecting SDIN1 for DAC2
+   * again causes the first pair to be presented on both DAC banks. */
+  ESP_RETURN_ON_ERROR(ak4619_write(REG_DAC_INPUT_SEL, 0x04), TAG,
                       "DAC input select");
   ESP_RETURN_ON_ERROR(ak4619_write(REG_POWER, 0x37), TAG, "Power-up");
 
