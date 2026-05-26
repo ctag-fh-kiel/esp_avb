@@ -23,7 +23,7 @@ set(avb_srcs avb.c avbutils.c avbnet.c msrp.c avtp.c avbstats.c)
 if(CONFIG_ESP_AVB_ROLE_BRIDGE)
     list(APPEND avb_srcs avbbridge.c avbfqtss.c)
 else()
-    list(APPEND avb_srcs avbcodec.c atdecc.c avbpll.c)
+    list(APPEND avb_srcs avbcodec.c ak4619.c atdecc.c avbpll.c)
 endif()
 
 idf_component_register(SRCS ${avb_srcs}

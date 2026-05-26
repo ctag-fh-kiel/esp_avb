@@ -61,7 +61,8 @@ typedef enum {
 /* Codec types */
 typedef enum {
   avb_codec_type_es8311, // Everest Semiconductor ES8311
-  avb_codec_type_es8388  // Everest Semiconductor ES8388
+  avb_codec_type_es8388, // Everest Semiconductor ES8388
+  avb_codec_type_ak4619  // Asahi Kasei AK4619
 } avb_codec_type_t;
 
 /* Codec control ranges (in tenths of dB for AECP control values) */
@@ -97,6 +98,8 @@ typedef struct {
   uint8_t din;        // I2S data in (codec ADC -> host)
   uint8_t i2c_scl;    // I2C SCL
   uint8_t i2c_sda;    // I2C SDA
+  uint8_t i2c_port;   // I2C controller number
+  int16_t reset;      // codec reset/PDN, -1 if unused
   int16_t pa;         // PA enable (output amplifier), -1 if unused
   bool pa_reverted;   // true if PA enable pin is active-low (inverter on board)
 } avb_codec_pins_s;
@@ -126,7 +129,7 @@ typedef struct {
   uint8_t i2s_port;                          // i2s port number
   avb_codec_pins_s codec_pins;               // i2s/i2c/PA pin assignments
   esp_eth_handle_t *eth_handle;              // ethernet handle
-  const avb_codec_type_t codec_type;         // codec type
+  avb_codec_type_t codec_type;               // codec type
   uint32_t default_sample_rate;              // default sample rate
   uint32_t default_presentation_time_offset_ns; // default Stream Output presentation offset
   uint8_t default_bits_per_sample;           // default bits per sample

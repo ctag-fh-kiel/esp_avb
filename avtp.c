@@ -536,6 +536,22 @@ static inline void be32_to_aaf(const uint8_t *in, uint8_t *out, int n) {
   memcpy(out, in, n * 4);
 }
 
+static void i2s32_to_aaf_channels(const uint8_t *in, uint8_t *out,
+                                  int frames, int input_channels,
+                                  int output_channels) {
+  int copy_channels =
+      input_channels < output_channels ? input_channels : output_channels;
+  for (int frame = 0; frame < frames; frame++) {
+    memcpy(out, in, copy_channels * 4);
+    if (output_channels > copy_channels) {
+      memset(out + copy_channels * 4, 0,
+             (output_channels - copy_channels) * 4);
+    }
+    in += input_channels * 4;
+    out += output_channels * 4;
+  }
+}
+
 /* Frame layout constants for ETH+VLAN+AVTP */
 #define TX_ETH_HDR_LEN 14  /* dst(6) + src(6) + ethertype(2) */
 #define TX_VLAN_TAG_LEN 4  /* TCI(2) + inner ethertype(2) */
@@ -578,11 +594,11 @@ static void avb_stream_out_task(void *task_param) {
   uint8_t sample_rate_code = sample_rate_to_aaf_code(params->sample_rate);
   bool is_am824 = (params->format_subtype == avtp_subtype_61883);
 
-  /* I2S reads stereo (2ch) regardless of stream channel count.
-   * Extra channels (ch2-7) are zero-padded in the AVTP conversion.
-   * Codec configures I2S with 24-bit data / 24-bit slot = 3 bytes/sample. */
-  int i2s_channels = 2;         /* ES8311 mic is stereo */
-  int i2s_bytes_per_sample = 3; /* 24-bit slot */
+  bool ak4619 = state->config.codec_type == avb_codec_type_ak4619;
+  /* AK4619 uses four 32-bit TDM slots whose byte order already matches AAF
+   * INT32. Legacy codecs expose stereo 24-bit slots. */
+  int i2s_channels = ak4619 ? 4 : 2;
+  int i2s_bytes_per_sample = ak4619 ? 4 : 3;
   int i2s_read_size =
       params->samples_per_packet * i2s_channels * i2s_bytes_per_sample;
 
@@ -1082,7 +1098,10 @@ static void avb_stream_out_task(void *task_param) {
         memset(i2s_buf, 0, i2s_read_size); /* underrun — silence */
         i2s_zero_reads++;
       }
-      if (is_am824)
+      if (ak4619 && !is_am824)
+        i2s32_to_aaf_channels(i2s_buf, audio_dst, params->samples_per_packet,
+                              i2s_channels, params->channels);
+      else if (is_am824)
         i2s24_to_am824_mono(i2s_buf, audio_dst, params->samples_per_packet,
                             params->channels);
       else
@@ -1193,8 +1212,9 @@ typedef struct {
   _Atomic uint32_t tail;   /* read position (consumer only) */
 } jitter_ring_t;
 
-#define JITTER_RING_SIZE 16384
-#define JITTER_PREFILL   576    /* ~2 ms at 48 kHz stereo 24-bit */
+#define JITTER_RING_SIZE_STD 16384
+#define JITTER_RING_SIZE_TDM32_4CH 65536
+#define JITTER_PREFILL_STD 576 /* ~2 ms at 48 kHz stereo 24-bit */
 
 static inline uint32_t ring_readable(const jitter_ring_t *r) {
   return atomic_load_explicit(&r->head, memory_order_acquire) -
@@ -1341,13 +1361,21 @@ static void stream_in_drain_cb(void *arg) {
   stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
   if (!ctx)
     return;
+  uint32_t prefill = ctx->state
+                         ? (ctx->state->media_clock.listener_byterate / 500u)
+                         : JITTER_PREFILL_STD;
+  uint32_t frame_bytes =
+      (ctx->state &&
+       ctx->state->config.codec_type == avb_codec_type_ak4619)
+          ? 16u
+          : 6u;
 
   /* Hold the drain off until the ring has reached the startup prefill.
    * The resulting fill depth becomes the deterministic listener-internal
    * latency from packet arrival to DAC output. */
   static bool locked = false;
   if (!locked) {
-    if (ring_readable(&ctx->ring) < JITTER_PREFILL)
+    if (ring_readable(&ctx->ring) < prefill)
       return;
     locked = true;
     if (!ctx->ever_locked) {
@@ -1375,8 +1403,8 @@ static void stream_in_drain_cb(void *arg) {
   uint32_t to_read = avail;
   if (to_read > DRAIN_MAX_BYTES)
     to_read = DRAIN_MAX_BYTES;
-  /* Align to frame boundary (6 bytes = stereo 24-bit sample pair) */
-  to_read = (to_read / 6) * 6;
+  /* Align to the selected codec frame boundary. */
+  to_read = (to_read / frame_bytes) * frame_bytes;
   if (to_read == 0)
     return;
 
@@ -1568,27 +1596,39 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     ctx->diag_captured = 1;
   }
 
-  /* AVTP wire → I2S stereo 24-bit samples, written directly into the
-   * jitter ring with a single atomic head-publish at the end. I2S slot
-   * config is big-endian (avbcodec.c: slot_cfg.big_endian = true) so the
-   * DMA/DAC path expects [MSB, MID, LSB] in memory — same byte order as
-   * AAF wire format, which lets us memcpy the 3 sample bytes straight
-   * across. AM824 prefixes a label byte; skip it. Extra channels are
-   * ignored. */
-  uint32_t total = (uint32_t)samples * 6; /* stereo 24-bit */
+  bool ak4619 =
+      ctx->state && ctx->state->config.codec_type == avb_codec_type_ak4619;
+  int i2s_channels = ak4619 ? 4 : 2;
+  int i2s_bytes_per_sample = ak4619 ? 4 : 3;
+
+  /* AVTP wire to the selected I2S memory format. The AK4619 AAF format is
+   * already four 32-bit, big-endian samples and is copied without truncation.
+   * Legacy codecs take the significant 24 bits of the first two channels. */
+  uint32_t total =
+      (uint32_t)samples * i2s_channels * i2s_bytes_per_sample;
   if (total > 0 && ring_writable(&ctx->ring) >= total) {
     uint32_t h = atomic_load_explicit(&ctx->ring.head, memory_order_relaxed);
     uint32_t mask = ctx->ring.capacity - 1;
     uint8_t *rbuf = ctx->ring.buf;
     uint32_t offset = 0;
     for (int s = 0; s < samples; s++) {
-      for (int ch = 0; ch < 2; ch++) {
+      for (int ch = 0; ch < i2s_channels; ch++) {
         int src_ch = (ch < channels) ? ch : 0;
         int src_offset = (s * channels + src_ch) * 4;
         uint32_t p0 = (h + offset + 0) & mask;
         uint32_t p1 = (h + offset + 1) & mask;
         uint32_t p2 = (h + offset + 2) & mask;
-        if (subtype == avtp_subtype_aaf) {
+        uint32_t p3 = (h + offset + 3) & mask;
+        if (subtype == avtp_subtype_aaf && ak4619) {
+          if (src_offset + 3 < pcm_len) {
+            rbuf[p0] = pcm_data[src_offset + 0];
+            rbuf[p1] = pcm_data[src_offset + 1];
+            rbuf[p2] = pcm_data[src_offset + 2];
+            rbuf[p3] = pcm_data[src_offset + 3];
+          } else {
+            rbuf[p0] = rbuf[p1] = rbuf[p2] = rbuf[p3] = 0;
+          }
+        } else if (subtype == avtp_subtype_aaf) {
           /* AAF: [MSB, MID, LSB, pad] → I2S memory [MSB, MID, LSB] */
           if (src_offset + 2 < pcm_len) {
             rbuf[p0] = pcm_data[src_offset + 0];
@@ -1597,16 +1637,20 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
           } else {
             rbuf[p0] = rbuf[p1] = rbuf[p2] = 0;
           }
-        } else { /* AM824: [label, MSB, MID, LSB] → [MSB, MID, LSB] */
+        } else { /* AM824: discard label and retain the significant PCM bits. */
           if (src_offset + 3 < pcm_len) {
             rbuf[p0] = pcm_data[src_offset + 1];
             rbuf[p1] = pcm_data[src_offset + 2];
             rbuf[p2] = pcm_data[src_offset + 3];
+            if (ak4619)
+              rbuf[p3] = 0;
           } else {
             rbuf[p0] = rbuf[p1] = rbuf[p2] = 0;
+            if (ak4619)
+              rbuf[p3] = 0;
           }
         }
-        offset += 3;
+        offset += i2s_bytes_per_sample;
       }
     }
     /* Publish — drain can't see any of the bytes we just wrote until
@@ -1973,10 +2017,8 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
     return ERROR;
   }
 
-  /* Allocate ctx + the ring/drain/convert buffers. Ring size is power of 2
-   * (see JITTER_RING_SIZE) — 16 KB ≈ 56 ms of 48 kHz stereo 24-bit audio.
-   * Oversized vs the Class A transit budget (2 ms) on purpose so NVS
-   * flash-cache-disable windows (≤50 ms) don't starve the drain. */
+  /* Allocate a power-of-two jitter ring large enough for a flash-cache pause.
+   * Four-channel INT32 requires a larger ring than stereo 24-bit. */
   stream_rx_ctx_t *ctx = calloc(1, sizeof(stream_rx_ctx_t));
   if (!ctx) {
     avberr("Stream in: no memory for context");
@@ -1987,13 +2029,18 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   memcpy(ctx->expected_stream_id, state->input_streams[index].stream_id,
          UNIQUE_ID_LEN);
 
-  ctx->ring.buf = calloc(1, JITTER_RING_SIZE);
+  uint32_t ring_size = state->config.codec_type == avb_codec_type_ak4619
+                           ? JITTER_RING_SIZE_TDM32_4CH
+                           : JITTER_RING_SIZE_STD;
+  uint32_t prefill = state->media_clock.listener_byterate / 500u;
+  ctx->ring.buf = calloc(1, ring_size);
   if (!ctx->ring.buf) {
-    avberr("Stream in: no memory for jitter ring (%d B)", JITTER_RING_SIZE);
+    avberr("Stream in: no memory for jitter ring (%lu B)",
+           (unsigned long)ring_size);
     free(ctx);
     return ERROR;
   }
-  ctx->ring.capacity = JITTER_RING_SIZE;
+  ctx->ring.capacity = ring_size;
   atomic_store(&ctx->ring.head, 0);
   atomic_store(&ctx->ring.tail, 0);
 
@@ -2028,8 +2075,8 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   /* Register the shared dispatcher — routes to audio stream input or CRF by stream_id */
   avb_net_set_stream_rx_handler(avb_stream_rx_dispatcher, NULL);
 
-  avbinfo("Stream in started (ring=%d B, prefill=%d B, 1 ms drain)",
-          JITTER_RING_SIZE, JITTER_PREFILL);
+  avbinfo("Stream in started (ring=%lu B, prefill=%lu B, 1 ms drain)",
+          (unsigned long)ring_size, (unsigned long)prefill);
   return OK;
 }
 

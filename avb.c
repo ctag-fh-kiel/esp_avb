@@ -172,21 +172,36 @@ static size_t avb_build_audio_formats(avtp_stream_format_s *formats,
                                       size_t max_formats,
                                       const uint32_t *sample_rates,
                                       size_t sample_rate_count,
-                                      uint8_t channels_per_stream) {
+                                      uint8_t channels_per_stream,
+                                      bool ak4619) {
   size_t n = 0;
-  for (size_t i = 0; i < sample_rate_count && n + 1 < max_formats; i++) {
+  for (size_t i = 0; i < sample_rate_count && n < max_formats; i++) {
     uint32_t hz = sample_rates[i];
-    avtp_stream_format_am824_s am824 =
-        AVB_DEFAULT_FORMAT_AM824(avb_cip_sfc_from_hz(hz),
-                                 channels_per_stream);
+    if (!ak4619 && n < max_formats) {
+      avtp_stream_format_am824_s am824 =
+          AVB_DEFAULT_FORMAT_AM824(avb_cip_sfc_from_hz(hz),
+                                   channels_per_stream);
+      formats[n++].am824 = am824;
+    }
+    uint8_t aaf_channels = ak4619 ? 8 : channels_per_stream;
     avtp_stream_format_aaf_pcm_s aaf =
-        AVB_DEFAULT_FORMAT_AAF(32, avb_aaf_rate_from_hz(hz),
-                               channels_per_stream, false);
+        AVB_DEFAULT_FORMAT_AAF(32, avb_aaf_rate_from_hz(hz), aaf_channels,
+                               false);
     uint16_t spf = avb_samples_per_frame_from_hz(hz);
     aaf.samples_per_frame_h = (spf >> 8) & 0x03;
     aaf.samples_per_frame = spf & 0xFF;
-    formats[n++].am824 = am824;
-    formats[n++].aaf_pcm = aaf;
+    if (n < max_formats)
+      formats[n++].aaf_pcm = aaf;
+
+    if (ak4619 && hz == 48000 && n < max_formats) {
+      /* Sonnet/Mac AVB-compatible representation: the AAF encoding remains
+       * INT32, with 24 meaningful bits left-justified in each container. */
+      avtp_stream_format_aaf_pcm_s compatible =
+          AVB_DEFAULT_FORMAT_AAF(24, avb_aaf_rate_from_hz(hz), 8, false);
+      compatible.samples_per_frame_h = (spf >> 8) & 0x03;
+      compatible.samples_per_frame = spf & 0xFF;
+      formats[n++].aaf_pcm = compatible;
+    }
   }
   return n;
 }
@@ -436,19 +451,26 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
 
   // Build supported stream formats for each direction from the effective
   // sample-rate capabilities (codec caps ∩ config policy).
+  bool ak4619 = state->config.codec_type == avb_codec_type_ak4619;
   state->num_supported_formats_in = avb_build_audio_formats(
       state->supported_formats_in, AEM_MAX_NUM_FORMATS,
       state->supported_sample_rates.sample_rates,
       state->supported_sample_rates.num_rates,
-      state->config.channels_per_stream);
+      state->config.channels_per_stream, ak4619);
   state->num_supported_formats_out = avb_build_audio_formats(
       state->supported_formats_out, AEM_MAX_NUM_FORMATS,
       state->supported_sample_rates.sample_rates,
       state->supported_sample_rates.num_rates,
-      state->config.channels_per_stream);
+      state->config.channels_per_stream, ak4619);
   avtp_stream_format_aaf_pcm_s format = AVB_DEFAULT_FORMAT_AAF(
       32, avb_aaf_rate_from_hz(state->config.default_sample_rate),
       state->config.channels_per_stream, false);
+  if (ak4619) {
+    format =
+        (avtp_stream_format_aaf_pcm_s)AVB_DEFAULT_FORMAT_AAF(
+            24, avb_aaf_rate_from_hz(state->config.default_sample_rate), 8,
+            false);
+  }
 
   // setup listener stream flags, and stream info flags, default vlan id and
   // stream format
@@ -1103,8 +1125,7 @@ int avb_stop() {
   return OK;
 }
 
-/* Identify tone task — plays a 24-bit 1kHz sine wave through I2S TX
- * without reconfiguring the codec. Self-deleting. */
+/* Identify tone task: write in the selected codec's native slot geometry. */
 static void identify_tone_task(void *param) {
   avb_state_s *state = (avb_state_s *)param;
   if (!state || !state->i2s_tx_handle) {
@@ -1123,11 +1144,16 @@ static void identify_tone_task(void *param) {
       -990239, -1195498, -1425006, -1682125, -1970389, -2293550};
 
   int frames_per_ms = 48;
-  uint8_t buf[48 * 6]; /* 1ms worth of 24-bit stereo */
+  bool ak4619 = state->config.codec_type == avb_codec_type_ak4619;
+  size_t frame_bytes = ak4619 ? 16 : 6;
+  uint8_t buf[48 * 16];
+  size_t buf_len = frames_per_ms * frame_bytes;
   uint32_t duration_ms = 500;
   uint32_t phase = 0;
 
   const audio_codec_if_t *codec = (const audio_codec_if_t *)state->codec_if;
+  if (ak4619)
+    avb_codec_set_vol(state, state->ctrl_speaker_vol);
   if (codec) {
     if (codec->mute) {
       int ret = codec->mute(codec, false);
@@ -1183,19 +1209,27 @@ static void identify_tone_task(void *param) {
     uint8_t *p = buf;
     for (int i = 0; i < frames_per_ms; i++) {
       int32_t val = sine48[phase % 48];
-      /* 24-bit big-endian stereo: [MSB, MID, LSB, MSB, MID, LSB].
-       * I2S is configured with slot_cfg.big_endian = true. */
-      p[0] = (val >> 16) & 0xFF;
-      p[1] = (val >> 8) & 0xFF;
-      p[2] = val & 0xFF;
-      p[3] = p[0];
-      p[4] = p[1];
-      p[5] = p[2];
-      p += 6;
+      if (ak4619) {
+        for (int ch = 0; ch < 4; ch++) {
+          p[0] = (val >> 16) & 0xFF;
+          p[1] = (val >> 8) & 0xFF;
+          p[2] = val & 0xFF;
+          p[3] = 0;
+          p += 4;
+        }
+      } else {
+        p[0] = (val >> 16) & 0xFF;
+        p[1] = (val >> 8) & 0xFF;
+        p[2] = val & 0xFF;
+        p[3] = p[0];
+        p[4] = p[1];
+        p[5] = p[2];
+        p += 6;
+      }
       phase++;
     }
     size_t bw = 0;
-    i2s_channel_write(state->i2s_tx_handle, buf, sizeof(buf), &bw, 10);
+    i2s_channel_write(state->i2s_tx_handle, buf, buf_len, &bw, 10);
   }
 
   avbinfo("Identify tone: done");
@@ -1230,6 +1264,9 @@ static void avb_audio_test_task(void *param) {
   /* Make sure the codec is unmuted at the saved volume so the user actually
    * hears the tone (mirrors what identify_tone_task does). */
   const audio_codec_if_t *codec = (const audio_codec_if_t *)state->codec_if;
+  bool ak4619 = state->config.codec_type == avb_codec_type_ak4619;
+  if (ak4619)
+    avb_codec_set_vol(state, state->ctrl_speaker_vol);
   if (codec) {
     if (codec->mute) {
       int r = codec->mute(codec, false);
@@ -1277,16 +1314,15 @@ static void avb_audio_test_task(void *param) {
             state->config.codec_pins.pa, pa_active);
   }
 
-  /* Generate 1 kHz sine on the fly so any sample rate works. ~50% amplitude
-   * in 24-bit signed (matches identify tone level). 24-bit big-endian stereo
-   * to match the I2S slot config. Write 1 ms chunks. */
+  /* Generate 1 kHz sine on the fly and write the codec's native slots. */
   const float tone_hz = 1000.0f;
   const float two_pi = 6.28318530717958647692f;
   const float phase_inc = two_pi * tone_hz / (float)actual_rate;
   const int32_t amp = 4194304; /* ~0.5 of full-scale 24-bit */
   uint32_t frames_per_ms = actual_rate / 1000;
   if (frames_per_ms < 1) frames_per_ms = 1;
-  size_t buf_len = frames_per_ms * 6; /* 24-bit stereo = 6 bytes/frame */
+  size_t frame_bytes = ak4619 ? 16 : 6;
+  size_t buf_len = frames_per_ms * frame_bytes;
   uint8_t *buf = malloc(buf_len);
   if (buf) {
     float phase = 0.0f;
@@ -1295,11 +1331,23 @@ static void avb_audio_test_task(void *param) {
       uint8_t *p = buf;
       for (uint32_t i = 0; i < frames_per_ms; i++) {
         int32_t v = (int32_t)(sinf(phase) * (float)amp);
-        p[0] = (v >> 16) & 0xFF;
-        p[1] = (v >> 8)  & 0xFF;
-        p[2] = v         & 0xFF;
-        p[3] = p[0]; p[4] = p[1]; p[5] = p[2];
-        p += 6;
+        if (ak4619) {
+          for (int ch = 0; ch < 4; ch++) {
+            p[0] = (v >> 16) & 0xFF;
+            p[1] = (v >> 8) & 0xFF;
+            p[2] = v & 0xFF;
+            p[3] = 0;
+            p += 4;
+          }
+        } else {
+          p[0] = (v >> 16) & 0xFF;
+          p[1] = (v >> 8) & 0xFF;
+          p[2] = v & 0xFF;
+          p[3] = p[0];
+          p[4] = p[1];
+          p[5] = p[2];
+          p += 6;
+        }
         phase += phase_inc;
         if (phase >= two_pi) phase -= two_pi;
       }

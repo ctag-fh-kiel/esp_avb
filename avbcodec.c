@@ -10,13 +10,14 @@
  */
 
 #include "avb.h"
+#include "ak4619.h"
 #include "es8311_codec.h"
 #include "es8388_codec.h"
+#include "driver/i2s_tdm.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "soc/soc_caps.h" /* SOC_CLK_APLL_SUPPORTED */
 
-#define I2C_NUM (0)
 #define AVB_MCLK_MULTIPLE                                                      \
   (384) // If not using 24-bit data width, 256 should be enough
 
@@ -52,6 +53,21 @@ static const avb_codec_caps_s s_es8388_caps = {
                        .gain_default_tenth_db = 90},
 };
 
+static const avb_codec_caps_s s_ak4619_caps = {
+    .sample_rates = {.sample_rates = {48000}, .num_rates = 1},
+    .bit_rates = {.bit_rates = {32}, .num_rates = 1},
+    .max_input_channels = 4,
+    .max_output_channels = 4,
+    .control_ranges = {.vol_min_tenth_db = -1150,
+                       .vol_max_tenth_db = 120,
+                       .vol_step_tenth_db = 5,
+                       .vol_default_tenth_db = -100,
+                       .gain_min_tenth_db = -60,
+                       .gain_max_tenth_db = 270,
+                       .gain_step_tenth_db = 30,
+                       .gain_default_tenth_db = 0},
+};
+
 int16_t avb_codec_quantize_tenth_db(const codec_control_range_s *ranges,
                                      bool gain, int16_t value_tenth_db) {
   int16_t min = gain ? ranges->gain_min_tenth_db : ranges->vol_min_tenth_db;
@@ -85,6 +101,8 @@ const avb_codec_caps_s *avb_codec_get_caps(avb_codec_type_t codec_type) {
     return &s_es8311_caps;
   case avb_codec_type_es8388:
     return &s_es8388_caps;
+  case avb_codec_type_ak4619:
+    return &s_ak4619_caps;
   default:
     return NULL;
   }
@@ -122,59 +140,66 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   chan_cfg.dma_desc_num = 16;
   ESP_ERROR_CHECK(
       i2s_new_channel(&chan_cfg, &state->i2s_tx_handle, &state->i2s_rx_handle));
-  i2s_std_config_t std_cfg = {
-      .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(state->config.default_sample_rate),
-      .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-          state->config.default_bits_per_sample, I2S_SLOT_MODE_STEREO),
-      .gpio_cfg =
-          {
-              .mclk = state->config.codec_pins.mclk,
-              .bclk = state->config.codec_pins.bclk,
-              .ws = state->config.codec_pins.ws,
-              .dout = state->config.codec_pins.dout,
-              .din = state->config.codec_pins.din,
-              .invert_flags =
-                  {
-                      .mclk_inv = false,
-                      .bclk_inv = false,
-                      .ws_inv = false,
-                  },
-          },
-  };
-  std_cfg.clk_cfg.mclk_multiple = AVB_MCLK_MULTIPLE;
-  /* Use APLL as the clock source so the Milan media-clock PLL
-   * (avb_mclk / avb_mclk_apll) can retune MCLK with sub-ppm precision
-   * without having to disable/reconfigure the I2S channel.
-   *
-   * On SOCs without an APLL (e.g. esp32c6) fall back to XTAL — the
-   * Milan PLL's hardware-tune path is a no-op there (see avbpll.c's
-   * SOC_CLK_APLL_SUPPORTED gate); Phase 6b.2 will need a software-only
-   * clock-recovery alternative for that target. */
+  if (state->config.codec_type == avb_codec_type_ak4619) {
+    i2s_tdm_config_t tdm_cfg = {
+        .clk_cfg = I2S_TDM_CLK_DEFAULT_CONFIG(state->config.default_sample_rate),
+        .slot_cfg = I2S_TDM_PHILIPS_SLOT_DEFAULT_CONFIG(
+            I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO,
+            I2S_TDM_SLOT0 | I2S_TDM_SLOT1 | I2S_TDM_SLOT2 | I2S_TDM_SLOT3),
+        .gpio_cfg =
+            {
+                .mclk = state->config.codec_pins.mclk,
+                .bclk = state->config.codec_pins.bclk,
+                .ws = state->config.codec_pins.ws,
+                .dout = state->config.codec_pins.dout,
+                .din = state->config.codec_pins.din,
+            },
+    };
+    tdm_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
 #if SOC_CLK_APLL_SUPPORTED
-  std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
+    tdm_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
 #else
-  std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_XTAL;
+    tdm_cfg.clk_cfg.clk_src = I2S_CLK_SRC_XTAL;
 #endif
-  /* Big-endian in-memory sample layout: byte[0]=MSB, byte[2]=LSB. This
-   * matches AVTP wire order so the stream-in handler can memcpy AAF
-   * payloads straight to the jitter ring with no per-sample shuffle. */
-  std_cfg.slot_cfg.big_endian = true;
-
-  // Initialize the I2S TX and RX channels
-  ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_tx_handle, &std_cfg));
-  ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_rx_handle, &std_cfg));
+    tdm_cfg.slot_cfg.big_endian = true;
+    ESP_ERROR_CHECK(i2s_channel_init_tdm_mode(state->i2s_tx_handle, &tdm_cfg));
+    ESP_ERROR_CHECK(i2s_channel_init_tdm_mode(state->i2s_rx_handle, &tdm_cfg));
+  } else {
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(state->config.default_sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+            state->config.default_bits_per_sample, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg =
+            {
+                .mclk = state->config.codec_pins.mclk,
+                .bclk = state->config.codec_pins.bclk,
+                .ws = state->config.codec_pins.ws,
+                .dout = state->config.codec_pins.dout,
+                .din = state->config.codec_pins.din,
+            },
+    };
+    std_cfg.clk_cfg.mclk_multiple = AVB_MCLK_MULTIPLE;
+#if SOC_CLK_APLL_SUPPORTED
+    std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
+#else
+    std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_XTAL;
+#endif
+    std_cfg.slot_cfg.big_endian = true;
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_tx_handle, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(state->i2s_rx_handle, &std_cfg));
+  }
 
   // Enable the I2S TX and RX channels
   ESP_ERROR_CHECK(i2s_channel_enable(state->i2s_tx_handle));
   ESP_ERROR_CHECK(i2s_channel_enable(state->i2s_rx_handle));
 
-  /* Publish the effective listener-side rates so the PLL and the
-   * stream-input drain no longer hardcode 48 kHz / 288000 B/s. The
-   * drain always outputs stereo 24-bit (2 ch × 3 B/frame); only the
-   * sample rate changes with config. */
+  /* Publish the effective listener-side byte rate for buffer sizing and PLL
+   * accounting. AK4619 uses four 32-bit TDM slots; legacy codecs use stereo
+   * 24-bit slots. */
   state->media_clock.listener_sample_rate = state->config.default_sample_rate;
   state->media_clock.listener_byterate =
-      state->config.default_sample_rate * 2u * 3u;
+      state->config.default_sample_rate *
+      ((state->config.codec_type == avb_codec_type_ak4619) ? 16u : 6u);
 
   /* Initialise the media-clock PLL now that I2S (and hence APLL) is up */
   uint32_t nominal_mclk =
@@ -292,7 +317,7 @@ esp_err_t avb_config_codec(avb_state_s *state) {
 
   i2c_master_bus_handle_t bus;
   i2c_master_bus_config_t bus_cfg = {
-      .i2c_port = I2C_NUM,
+      .i2c_port = state->config.codec_pins.i2c_port,
       .sda_io_num = state->config.codec_pins.i2c_sda,
       .scl_io_num = state->config.codec_pins.i2c_scl,
       .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -301,6 +326,27 @@ esp_err_t avb_config_codec(avb_state_s *state) {
   };
   ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &bus), TAG,
                       "create I2C master bus failed");
+
+  state->codec_ranges = caps->control_ranges;
+  state->codec_ranges.vol_default_tenth_db = avb_codec_quantize_tenth_db(
+      &state->codec_ranges, false, state->config.default_speaker_vol_tenth_db);
+  state->codec_ranges.gain_default_tenth_db = avb_codec_quantize_tenth_db(
+      &state->codec_ranges, true, state->config.default_mic_gain_tenth_db);
+  state->ctrl_speaker_vol = state->codec_ranges.vol_default_tenth_db / 10.0f;
+  state->ctrl_mic_gain = state->codec_ranges.gain_default_tenth_db / 10.0f;
+
+  if (state->config.codec_type == avb_codec_type_ak4619) {
+    ESP_RETURN_ON_ERROR(ak4619_configure(state, bus), TAG,
+                        "Configure AK4619 failed");
+    ESP_RETURN_ON_ERROR(ak4619_set_vol(state->ctrl_speaker_vol), TAG,
+                        "Set AK4619 output volume failed");
+    ESP_RETURN_ON_ERROR(ak4619_set_mic_gain(state->ctrl_mic_gain), TAG,
+                        "Set AK4619 input gain failed");
+    state->codec_enabled = true;
+    state->codec_if = NULL;
+    ESP_LOGI(TAG, "AK4619 configured and enabled (4ch TDM128 ADC+DAC active)");
+    return ESP_OK;
+  }
 
   const audio_codec_gpio_if_t *gpio_if = audio_codec_new_gpio();
 
@@ -340,14 +386,6 @@ esp_err_t avb_config_codec(avb_state_s *state) {
   state->codec_enabled = true;
   state->codec_if = result.codec_if;
 
-  state->codec_ranges = caps->control_ranges;
-  state->codec_ranges.vol_default_tenth_db = avb_codec_quantize_tenth_db(
-      &state->codec_ranges, false, state->config.default_speaker_vol_tenth_db);
-  state->codec_ranges.gain_default_tenth_db = avb_codec_quantize_tenth_db(
-      &state->codec_ranges, true, state->config.default_mic_gain_tenth_db);
-  state->ctrl_speaker_vol = state->codec_ranges.vol_default_tenth_db / 10.0f;
-  state->ctrl_mic_gain = state->codec_ranges.gain_default_tenth_db / 10.0f;
-
   if (result.codec_if->set_vol) {
     result.codec_if->set_vol(result.codec_if, state->ctrl_speaker_vol);
   }
@@ -361,6 +399,10 @@ esp_err_t avb_config_codec(avb_state_s *state) {
 
 /* Set speaker volume via codec interface */
 void avb_codec_set_vol(avb_state_s *state, float db) {
+  if (state->config.codec_type == avb_codec_type_ak4619) {
+    ak4619_set_vol(db);
+    return;
+  }
   const audio_codec_if_t *codec = (const audio_codec_if_t *)state->codec_if;
   if (codec && codec->set_vol) {
     codec->set_vol(codec, db);
@@ -369,6 +411,10 @@ void avb_codec_set_vol(avb_state_s *state, float db) {
 
 /* Set mic gain via codec interface */
 void avb_codec_set_mic_gain(avb_state_s *state, float db) {
+  if (state->config.codec_type == avb_codec_type_ak4619) {
+    ak4619_set_mic_gain(db);
+    return;
+  }
   const audio_codec_if_t *codec = (const audio_codec_if_t *)state->codec_if;
   if (codec && codec->set_mic_gain) {
     codec->set_mic_gain(codec, db);

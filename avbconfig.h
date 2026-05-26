@@ -104,6 +104,8 @@
                   .din = 11,                                                   \
                   .i2c_scl = 8,                                                \
                   .i2c_sda = 7,                                                \
+                  .i2c_port = 0,                                               \
+                  .reset = -1,                                                 \
                   .pa = 53,                                                    \
                   .pa_reverted = false},                                       \
    .eth_handle = NULL,                                                         \
