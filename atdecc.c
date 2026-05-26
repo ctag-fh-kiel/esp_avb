@@ -3495,12 +3495,17 @@ int avb_process_acmp_connect_tx_response(avb_state_s *state,
 
   bool start_stream_in = false;
   if (!disconnect) {
+    bool was_connected = state->input_streams[listener_uid].connected;
     // if succcessful connect tx response then connect the listener
     if (response->header.status_valtime == acmp_status_success) {
       status = avb_connect_listener(state, response);
       avbinfo("ConnTX rsp: listener_uid=%d, connect_status=%d", listener_uid,
               status);
-      start_stream_in = status == acmp_status_success;
+      start_stream_in = status == acmp_status_success && !was_connected;
+      if (status == acmp_status_success && was_connected) {
+        avbinfo("ConnTX rsp: listener_uid=%d already active; keeping stream-in",
+                listener_uid);
+      }
     } else {
       avbwarn("ConnTX rsp: talker returned status %d",
               response->header.status_valtime);
