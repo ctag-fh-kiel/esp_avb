@@ -161,7 +161,9 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
 #else
     tdm_cfg.clk_cfg.clk_src = I2S_CLK_SRC_XTAL;
 #endif
-    tdm_cfg.slot_cfg.big_endian = true;
+    /* Match the validated p4_audio_cape AK4619 reference implementation:
+     * ESP-IDF DMA buffers contain native little-endian int32_t slots. */
+    tdm_cfg.slot_cfg.big_endian = false;
     ESP_ERROR_CHECK(i2s_channel_init_tdm_mode(state->i2s_tx_handle, &tdm_cfg));
     ESP_ERROR_CHECK(i2s_channel_init_tdm_mode(state->i2s_rx_handle, &tdm_cfg));
   } else {

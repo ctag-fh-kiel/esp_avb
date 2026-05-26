@@ -1210,11 +1210,12 @@ static void identify_tone_task(void *param) {
     for (int i = 0; i < frames_per_ms; i++) {
       int32_t val = sine48[phase % 48];
       if (ak4619) {
+        int32_t sample = val * 256;
         for (int ch = 0; ch < 4; ch++) {
-          p[0] = (val >> 16) & 0xFF;
-          p[1] = (val >> 8) & 0xFF;
-          p[2] = val & 0xFF;
-          p[3] = 0;
+          p[0] = sample & 0xFF;
+          p[1] = (sample >> 8) & 0xFF;
+          p[2] = (sample >> 16) & 0xFF;
+          p[3] = (sample >> 24) & 0xFF;
           p += 4;
         }
       } else {
@@ -1318,7 +1319,7 @@ static void avb_audio_test_task(void *param) {
   const float tone_hz = 1000.0f;
   const float two_pi = 6.28318530717958647692f;
   const float phase_inc = two_pi * tone_hz / (float)actual_rate;
-  const int32_t amp = 4194304; /* ~0.5 of full-scale 24-bit */
+  const int32_t amp = ak4619 ? 1073741824 : 4194304;
   uint32_t frames_per_ms = actual_rate / 1000;
   if (frames_per_ms < 1) frames_per_ms = 1;
   size_t frame_bytes = ak4619 ? 16 : 6;
@@ -1333,10 +1334,10 @@ static void avb_audio_test_task(void *param) {
         int32_t v = (int32_t)(sinf(phase) * (float)amp);
         if (ak4619) {
           for (int ch = 0; ch < 4; ch++) {
-            p[0] = (v >> 16) & 0xFF;
+            p[0] = v & 0xFF;
             p[1] = (v >> 8) & 0xFF;
-            p[2] = v & 0xFF;
-            p[3] = 0;
+            p[2] = (v >> 16) & 0xFF;
+            p[3] = (v >> 24) & 0xFF;
             p += 4;
           }
         } else {

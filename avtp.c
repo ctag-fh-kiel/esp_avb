@@ -542,7 +542,14 @@ static void i2s32_to_aaf_channels(const uint8_t *in, uint8_t *out,
   int copy_channels =
       input_channels < output_channels ? input_channels : output_channels;
   for (int frame = 0; frame < frames; frame++) {
-    memcpy(out, in, copy_channels * 4);
+    for (int ch = 0; ch < copy_channels; ch++) {
+      const uint8_t *native = in + ch * 4;
+      uint8_t *wire = out + ch * 4;
+      wire[0] = native[3];
+      wire[1] = native[2];
+      wire[2] = native[1];
+      wire[3] = native[0];
+    }
     if (output_channels > copy_channels) {
       memset(out + copy_channels * 4, 0,
              (output_channels - copy_channels) * 4);
@@ -1601,9 +1608,9 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
   int i2s_channels = ak4619 ? 4 : 2;
   int i2s_bytes_per_sample = ak4619 ? 4 : 3;
 
-  /* AVTP wire to the selected I2S memory format. The AK4619 AAF format is
-   * already four 32-bit, big-endian samples and is copied without truncation.
-   * Legacy codecs take the significant 24 bits of the first two channels. */
+  /* AVTP wire to the selected I2S memory format. AK4619 I2S DMA follows the
+   * validated reference driver and holds native little-endian int32_t slots,
+   * while AAF samples are transmitted MSB-first on the wire. */
   uint32_t total =
       (uint32_t)samples * i2s_channels * i2s_bytes_per_sample;
   if (total > 0 && ring_writable(&ctx->ring) >= total) {
@@ -1621,10 +1628,10 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
         uint32_t p3 = (h + offset + 3) & mask;
         if (subtype == avtp_subtype_aaf && ak4619) {
           if (src_offset + 3 < pcm_len) {
-            rbuf[p0] = pcm_data[src_offset + 0];
-            rbuf[p1] = pcm_data[src_offset + 1];
-            rbuf[p2] = pcm_data[src_offset + 2];
-            rbuf[p3] = pcm_data[src_offset + 3];
+            rbuf[p0] = pcm_data[src_offset + 3];
+            rbuf[p1] = pcm_data[src_offset + 2];
+            rbuf[p2] = pcm_data[src_offset + 1];
+            rbuf[p3] = pcm_data[src_offset + 0];
           } else {
             rbuf[p0] = rbuf[p1] = rbuf[p2] = rbuf[p3] = 0;
           }
@@ -1639,11 +1646,16 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
           }
         } else { /* AM824: discard label and retain the significant PCM bits. */
           if (src_offset + 3 < pcm_len) {
-            rbuf[p0] = pcm_data[src_offset + 1];
-            rbuf[p1] = pcm_data[src_offset + 2];
-            rbuf[p2] = pcm_data[src_offset + 3];
-            if (ak4619)
-              rbuf[p3] = 0;
+            if (ak4619) {
+              rbuf[p0] = 0;
+              rbuf[p1] = pcm_data[src_offset + 3];
+              rbuf[p2] = pcm_data[src_offset + 2];
+              rbuf[p3] = pcm_data[src_offset + 1];
+            } else {
+              rbuf[p0] = pcm_data[src_offset + 1];
+              rbuf[p1] = pcm_data[src_offset + 2];
+              rbuf[p2] = pcm_data[src_offset + 3];
+            }
           } else {
             rbuf[p0] = rbuf[p1] = rbuf[p2] = 0;
             if (ak4619)

@@ -19,6 +19,8 @@
 #define REG_DAC_VOL1 0x0F
 #define REG_DAC_VOL2 0x10
 #define REG_DAC_VOL3 0x11
+#define REG_DAC_INPUT_SEL 0x12
+#define REG_DAC_MUTE_FILTER 0x14
 
 #define TAG "AK4619"
 
@@ -46,7 +48,9 @@ esp_err_t ak4619_set_vol(float db) {
   ESP_RETURN_ON_ERROR(ak4619_write(REG_DAC_VOL0, value), TAG, "DAC1L volume");
   ESP_RETURN_ON_ERROR(ak4619_write(REG_DAC_VOL1, value), TAG, "DAC1R volume");
   ESP_RETURN_ON_ERROR(ak4619_write(REG_DAC_VOL2, value), TAG, "DAC2L volume");
-  return ak4619_write(REG_DAC_VOL3, value);
+  ESP_RETURN_ON_ERROR(ak4619_write(REG_DAC_VOL3, value), TAG, "DAC2R volume");
+  ESP_LOGI(TAG, "DAC volume %.1f dB (VOLDA=0x%02x)", db, value);
+  return ESP_OK;
 }
 
 esp_err_t ak4619_set_mic_gain(float db) {
@@ -93,15 +97,23 @@ esp_err_t ak4619_configure(avb_state_s *state, i2c_master_bus_handle_t bus) {
   ESP_RETURN_ON_ERROR(ak4619_write(REG_AUDIO_IF1, 0x1C), TAG, "Audio IF1");
   ESP_RETURN_ON_ERROR(ak4619_write(REG_SYSCLK, 0x02), TAG, "MCLK 384fs");
   ESP_RETURN_ON_ERROR(ak4619_write(REG_ADC_IN_SEL, 0x55), TAG, "ADC inputs");
+  /* In TDM mode the multiplexed input is SDIN1. DAC2 defaults to SDIN2,
+   * which is ignored in TDM mode; route both DAC banks from SDIN1. */
+  ESP_RETURN_ON_ERROR(ak4619_write(REG_DAC_INPUT_SEL, 0x00), TAG,
+                      "DAC input select");
   ESP_RETURN_ON_ERROR(ak4619_write(REG_POWER, 0x37), TAG, "Power-up");
 
-  uint8_t if0 = 0, if1 = 0, sysclk = 0, power = 0;
+  uint8_t if0 = 0, if1 = 0, sysclk = 0, dac_input = 0, dac_ctl = 0, power = 0;
   if (ak4619_read(REG_AUDIO_IF0, &if0) == ESP_OK &&
       ak4619_read(REG_AUDIO_IF1, &if1) == ESP_OK &&
       ak4619_read(REG_SYSCLK, &sysclk) == ESP_OK &&
+      ak4619_read(REG_DAC_INPUT_SEL, &dac_input) == ESP_OK &&
+      ak4619_read(REG_DAC_MUTE_FILTER, &dac_ctl) == ESP_OK &&
       ak4619_read(REG_POWER, &power) == ESP_OK) {
-    ESP_LOGI(TAG, "Configured TDM128 IF0=%02x IF1=%02x SYSCLK=%02x PWR=%02x",
-             if0, if1, sysclk, power);
+    ESP_LOGI(TAG,
+             "Configured TDM128 IF0=%02x IF1=%02x SYSCLK=%02x DACSEL=%02x "
+             "DACCTL=%02x PWR=%02x",
+             if0, if1, sysclk, dac_input, dac_ctl, power);
   }
   return ESP_OK;
 }
