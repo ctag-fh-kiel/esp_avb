@@ -3103,6 +3103,11 @@ void avb_pll_deinit(void);
  * logs stats (including the drift sums maintained by the RX handlers),
  * and applies any due MCLK correction. */
 void avb_pll_tick(avb_state_s *state);
+/* Talker capture clock recovery. Adjusts the shared I2S APLL by one
+ * bounded increment when the ADC FIFO fill indicates drift relative to the
+ * gPTP-paced packet transmitter. An explicitly selected CRF clock source owns
+ * MCLK recovery instead; INTERNAL/gPTP operation may be bidirectional. */
+int avb_pll_adjust_talker_trim(avb_state_s *state, int32_t delta_ppm_q16);
 void avb_get_stream_in_counters(aem_stream_in_counters_val_s *valid,
                                 aem_stream_in_counters_s *counters);
 uint32_t aaf_code_to_sample_rate(uint8_t code);

@@ -791,6 +791,9 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t send_fail_count = 0;
   uint32_t i2s_zero_reads = 0;    /* reads that returned 0 bytes */
   uint32_t i2s_nonzero_audio = 0; /* reads with non-zero audio data */
+  uint32_t capture_full_count = 0;
+  int capture_fill_min = INT32_MAX;
+  int capture_fill_max = 0;
 
   /* gPTP discontinuity detection — mr and tu bit management.
    * mr toggles on media clock restart, tu=1 on gPTP GM change.
@@ -803,12 +806,14 @@ static void avb_stream_out_task(void *task_param) {
   bool tu_active = false;
   int tu_hold_remaining = 0;
 
-/* I2S RX local ring — absorbs DMA buffer timing mismatch.
- * Read larger chunks when available, consume i2s_read_size per packet. */
+/* I2S RX local ring: it is also the talker clock-recovery sensor. The network
+ * consumes exactly one AVTP packet per gPTP-paced interval; continuous I2S
+ * refill makes FIFO occupancy reveal whether ADC MCLK is fast or slow. */
   /* Ring size must be a multiple of i2s_read_size (bytes per AVTP packet)
-   * to avoid partial-frame reads at ring wrap boundaries.  Target ~5ms. */
+   * to avoid partial-frame reads at ring wrap boundaries. Eight ms leaves
+   * enough margin for a bounded trim loop without adding large capture delay. */
   int i2s_frame_bytes = i2s_channels * i2s_bytes_per_sample;
-  int i2s_ring_size = (int)(params->sample_rate * i2s_frame_bytes * 5 / 1000);
+  int i2s_ring_size = (int)(params->sample_rate * i2s_frame_bytes * 8 / 1000);
   /* Round down to nearest multiple of i2s_read_size */
   i2s_ring_size -= i2s_ring_size % i2s_read_size;
   if (i2s_ring_size < i2s_read_size * 4)
@@ -824,10 +829,10 @@ static void avb_stream_out_task(void *task_param) {
      * I2S DMA returns in chunks larger than requested (driver adjusts
      * dma_frame_num), so we fill as much as we can. */
     int frame_size = i2s_channels * i2s_bytes_per_sample;
-    int prefill_target = i2s_ring_size / 2; /* ~2.5ms of audio */
+    int prefill_target = i2s_ring_size / 2; /* ~4 ms of audio */
     while (i2s_ring_head < prefill_target) {
       int write_pos = i2s_ring_head % i2s_ring_size;
-      int space = i2s_ring_size - i2s_ring_head;
+      int space = prefill_target - i2s_ring_head;
       int chunk = i2s_ring_size - write_pos;
       if (chunk > space)
         chunk = space;
@@ -845,6 +850,10 @@ static void avb_stream_out_task(void *task_param) {
     }
     avbinfo("Stream out: I2S ring pre-filled %d bytes", i2s_ring_head);
   }
+  int i2s_ring_target = i2s_ring_size / 2;
+  const int32_t talker_trim_step_q16 = 5 * 65536; /* 5 ppm per 0.5 s max */
+  const uint32_t talker_trim_update_packets = 4000;
+  const int talker_trim_deadband_packets = 2;
 
   /* Sample PTP and send-time as late as possible — all logging and pre-fill
    * is done.  This ensures the first packet's presentation timestamp is
@@ -1081,11 +1090,10 @@ static void avb_stream_out_task(void *task_param) {
       else
         be32_to_aaf(pcm_buf, audio_dst, total_samples);
     } else {
-      /* Read mic audio via local ring — refill from I2S when low,
-       * consume i2s_read_size bytes per packet */
+      /* Refill every interval, not only on impending starvation. This keeps
+       * capture FIFO occupancy meaningful as a clock-error measurement. */
       int ring_avail = i2s_ring_head - i2s_ring_tail;
-      if (ring_avail < i2s_read_size) {
-        /* Refill: read as much as possible from I2S into ring */
+      {
         int ring_space = i2s_ring_size - ring_avail;
         int write_pos = i2s_ring_head % i2s_ring_size;
         int chunk = i2s_ring_size - write_pos; /* to end of buffer */
@@ -1097,21 +1105,22 @@ static void avb_stream_out_task(void *task_param) {
         /* Align chunk to frame boundary (6 bytes = 1 stereo 24-bit frame)
          * to prevent partial-frame reads that desync the ring buffer */
         chunk -= chunk % (i2s_channels * i2s_bytes_per_sample);
-        if (chunk == 0)
-          goto skip_refill;
-        i2s_channel_read(params->i2s_rx_handle, i2s_ring + write_pos, chunk,
-                         &bytes_read, 0);
-        /* Discard any trailing partial frame the driver might return */
-        bytes_read -= bytes_read % (i2s_channels * i2s_bytes_per_sample);
-        if (bytes_read > 0) {
-          i2s_ring_head += bytes_read;
-          i2s_nonzero_audio++;
+        if (chunk > 0) {
+          i2s_channel_read(params->i2s_rx_handle, i2s_ring + write_pos, chunk,
+                           &bytes_read, 0);
+          /* Discard any trailing partial frame the driver might return */
+          bytes_read -= bytes_read % (i2s_channels * i2s_bytes_per_sample);
+          if (bytes_read > 0) {
+            i2s_ring_head += bytes_read;
+            i2s_nonzero_audio++;
+          }
         } else {
-          i2s_zero_reads++;
+          capture_full_count++;
         }
+        /* A zero poll is harmless while the FIFO still feeds this packet;
+         * count true emitted silence below instead. */
         ring_avail = i2s_ring_head - i2s_ring_tail;
       }
-      skip_refill:
       /* Consume i2s_read_size bytes from ring */
       if (ring_avail >= i2s_read_size) {
         int read_pos = i2s_ring_tail % i2s_ring_size;
@@ -1123,9 +1132,25 @@ static void avb_stream_out_task(void *task_param) {
           memcpy(i2s_buf + first, i2s_ring, i2s_read_size - first);
         }
         i2s_ring_tail += i2s_read_size;
+        ring_avail -= i2s_read_size;
       } else {
         memset(i2s_buf, 0, i2s_read_size); /* underrun — silence */
         i2s_zero_reads++;
+      }
+      if (ring_avail < capture_fill_min)
+        capture_fill_min = ring_avail;
+      if (ring_avail > capture_fill_max)
+        capture_fill_max = ring_avail;
+
+      if (loop_count > 0 &&
+          (loop_count % talker_trim_update_packets) == 0) {
+        int fill_error = ring_avail - i2s_ring_target;
+        if (fill_error > talker_trim_deadband_packets * i2s_read_size) {
+          avb_pll_adjust_talker_trim(state, -talker_trim_step_q16);
+        } else if (fill_error <
+                   -talker_trim_deadband_packets * i2s_read_size) {
+          avb_pll_adjust_talker_trim(state, talker_trim_step_q16);
+        }
       }
       if (ak4619 && is_am824)
         i2s32_to_am824_channels(i2s_buf, audio_dst,
@@ -1171,6 +1196,17 @@ static void avb_stream_out_task(void *task_param) {
           "i2s: %lu zero_reads, %lu nonzero_audio",
           loop_count, send_fail_count, overrun_count, overrun_max,
           i2s_zero_reads, i2s_nonzero_audio);
+  if (!params->use_sine_wave) {
+    int32_t trim_centippm =
+        (int32_t)(((int64_t)state->media_clock.pll_applied_ppm_q16 * 100) /
+                  65536);
+    int32_t trim_abs = trim_centippm < 0 ? -trim_centippm : trim_centippm;
+    avbinfo("Capture clock: fill=%d..%d/%d B, full=%lu, trim=%s%ld.%02ld ppm",
+            capture_fill_min == INT32_MAX ? 0 : capture_fill_min,
+            capture_fill_max, i2s_ring_size, (unsigned long)capture_full_count,
+            trim_centippm < 0 ? "-" : "", (long)(trim_abs / 100),
+            (long)(trim_abs % 100));
+  }
   avbinfo("PLL: %lu measures, %lu skipped, offset [%ldns, %ldns]",
           pll_measure_count, pll_skip_count, (long)pll_offset_min,
           (long)pll_offset_max);

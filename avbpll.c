@@ -399,6 +399,28 @@ void avb_pll_deinit(void) {
   s_pll.valid = false;
 }
 
+int avb_pll_adjust_talker_trim(avb_state_s *state, int32_t delta_ppm_q16) {
+  /* Clock-source index 1 is the CRF stream input, which owns MCLK recovery.
+   * INTERNAL/gPTP mode may still have an audio listener active in duplex use;
+   * the shared ADC/DAC APLL then has the same gPTP target in both directions. */
+  if (!state || state->media_clock.active_clock_source_index == 1 ||
+      delta_ppm_q16 == 0)
+    return -1;
+
+  int32_t new_applied = state->media_clock.pll_applied_ppm_q16 + delta_ppm_q16;
+  if (new_applied > AVB_PLL_MAX_APPLIED_PPM_Q16)
+    new_applied = AVB_PLL_MAX_APPLIED_PPM_Q16;
+  if (new_applied < -AVB_PLL_MAX_APPLIED_PPM_Q16)
+    new_applied = -AVB_PLL_MAX_APPLIED_PPM_Q16;
+  if (new_applied == state->media_clock.pll_applied_ppm_q16)
+    return 0;
+
+  if (mclk_hw_tune_ppm_q16(new_applied) != 0)
+    return -1;
+  state->media_clock.pll_applied_ppm_q16 = new_applied;
+  return 0;
+}
+
 void avb_pll_tick(avb_state_s *state) {
   if (!state)
     return;
