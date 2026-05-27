@@ -14,6 +14,10 @@
 #define REG_SYSCLK 0x03
 #define REG_MIC_GAIN1 0x04
 #define REG_MIC_GAIN2 0x05
+#define REG_ADC_VOL0 0x06
+#define REG_ADC_VOL1 0x07
+#define REG_ADC_VOL2 0x08
+#define REG_ADC_VOL3 0x09
 #define REG_ADC_IN_SEL 0x0B
 #define REG_DAC_VOL0 0x0E
 #define REG_DAC_VOL1 0x0F
@@ -97,6 +101,12 @@ esp_err_t ak4619_configure(avb_state_s *state, i2c_master_bus_handle_t bus) {
   ESP_RETURN_ON_ERROR(ak4619_write(REG_AUDIO_IF1, 0x1C), TAG, "Audio IF1");
   ESP_RETURN_ON_ERROR(ak4619_write(REG_SYSCLK, 0x02), TAG, "MCLK 384fs");
   ESP_RETURN_ON_ERROR(ak4619_write(REG_ADC_IN_SEL, 0x55), TAG, "ADC inputs");
+  /* Reference audio-cape initialization programs each ADC digital gain at
+   * unity. Without these registers the capture path can remain attenuated. */
+  ESP_RETURN_ON_ERROR(ak4619_write(REG_ADC_VOL0, 0x30), TAG, "ADC1L volume");
+  ESP_RETURN_ON_ERROR(ak4619_write(REG_ADC_VOL1, 0x30), TAG, "ADC1R volume");
+  ESP_RETURN_ON_ERROR(ak4619_write(REG_ADC_VOL2, 0x30), TAG, "ADC2L volume");
+  ESP_RETURN_ON_ERROR(ak4619_write(REG_ADC_VOL3, 0x30), TAG, "ADC2R volume");
   /* Preserve the documented DAC pair selection. In TDM mode SDIN1 carries
    * four ordered slots (DAC1 L/R then DAC2 L/R); selecting SDIN1 for DAC2
    * again causes the first pair to be presented on both DAC banks. */
