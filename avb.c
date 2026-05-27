@@ -570,7 +570,7 @@ static int avb_initialize_state(avb_state_s *state, avb_config_s *config) {
   }
 
   // Initialize MAAP for output stream multicast address acquisition
-  if (config->talker) {
+  if (state->config.talker) {
     avb_maap_init(state);
   }
 
@@ -958,6 +958,9 @@ static void avb_task(void *task_param) {
     avberr("Failed to initialize AVB state, stopping AVB task");
     goto err;
   }
+  free(config);
+  task_param = NULL;
+  config = NULL;
 
   state->codec_enabled = false;
 
@@ -1060,6 +1063,7 @@ static void avb_task(void *task_param) {
     avb_process_statusreq(state);
   } // while (!state->stop)
 err:
+  free(task_param);
   if (state) {
     avb_destroy_state(state);
     free(state);
@@ -1079,10 +1083,21 @@ int avb_start(avb_config_s *config) {
     return ERROR;
   }
   if (s_state == NULL) {
+    avb_config_s *owned_config = malloc(sizeof(*owned_config));
+    if (!owned_config) {
+      avberr("No memory for AVB configuration");
+      return ERROR;
+    }
+    memcpy(owned_config, config, sizeof(*owned_config));
     /* Keep discovery, ATDECC, MSRP, MAAP and persistence on core 0.
      * Core 1 is reserved for AVB-IN playback and AVB-OUT capture/TX. */
-    xTaskCreatePinnedToCore(avb_task, "AVB", 16384, (void *)config, 21, NULL,
-                            0);
+    if (xTaskCreatePinnedToCore(avb_task, "AVB", 16384,
+                                (void *)owned_config, 21, NULL, 0) !=
+        pdPASS) {
+      free(owned_config);
+      avberr("Failed to start AVB task");
+      return ERROR;
+    }
     return OK;
   }
   avberr("Another instance of AVB is already running");
