@@ -176,11 +176,20 @@ static size_t avb_build_audio_formats(avtp_stream_format_s *formats,
   size_t n = 0;
   for (size_t i = 0; i < sample_rate_count && n < max_formats; i++) {
     uint32_t hz = sample_rates[i];
-    if (!ak4619 && n < max_formats) {
+    if (n < max_formats) {
       avtp_stream_format_am824_s am824 =
           AVB_DEFAULT_FORMAT_AM824(avb_cip_sfc_from_hz(hz),
-                                   channels_per_stream);
+                                   ak4619 ? 8 : channels_per_stream);
+      /* Fixed AM8-24 matches MOTU talkers that transmit all eight MBLA
+       * blocks. Keep this exact descriptor as the primary AM824 format. */
       formats[n++].am824 = am824;
+      if (ak4619 && n < max_formats) {
+        /* Also accept a non-blocking AM8-24 source that sends fewer active
+         * data blocks; UT changes the descriptor and must be advertised as a
+         * separate format for exact AECP SET_STREAM_FORMAT matching. */
+        am824.ut = 1;
+        formats[n++].am824 = am824;
+      }
     }
     uint8_t aaf_channels = ak4619 ? 8 : channels_per_stream;
     avtp_stream_format_aaf_pcm_s aaf =

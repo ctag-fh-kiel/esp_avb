@@ -558,6 +558,30 @@ static void i2s32_to_aaf_channels(const uint8_t *in, uint8_t *out,
   }
 }
 
+static void i2s32_to_am824_channels(const uint8_t *in, uint8_t *out,
+                                    int frames, int input_channels,
+                                    int output_channels) {
+  int copy_channels =
+      input_channels < output_channels ? input_channels : output_channels;
+  for (int frame = 0; frame < frames; frame++) {
+    for (int ch = 0; ch < copy_channels; ch++) {
+      const uint8_t *native = in + ch * 4;
+      uint8_t *wire = out + ch * 4;
+      wire[0] = 0x40;      /* MBLA, 24-bit linear audio */
+      wire[1] = native[3]; /* native LE int32 -> significant PCM bytes */
+      wire[2] = native[2];
+      wire[3] = native[1];
+    }
+    for (int ch = copy_channels; ch < output_channels; ch++) {
+      uint8_t *wire = out + ch * 4;
+      wire[0] = 0x40;
+      wire[1] = wire[2] = wire[3] = 0;
+    }
+    in += input_channels * 4;
+    out += output_channels * 4;
+  }
+}
+
 /* Frame layout constants for ETH+VLAN+AVTP */
 #define TX_ETH_HDR_LEN 14  /* dst(6) + src(6) + ethertype(2) */
 #define TX_VLAN_TAG_LEN 4  /* TCI(2) + inner ethertype(2) */
@@ -1103,7 +1127,11 @@ static void avb_stream_out_task(void *task_param) {
         memset(i2s_buf, 0, i2s_read_size); /* underrun — silence */
         i2s_zero_reads++;
       }
-      if (ak4619 && !is_am824)
+      if (ak4619 && is_am824)
+        i2s32_to_am824_channels(i2s_buf, audio_dst,
+                                params->samples_per_packet, i2s_channels,
+                                params->channels);
+      else if (ak4619)
         i2s32_to_aaf_channels(i2s_buf, audio_dst, params->samples_per_packet,
                               i2s_channels, params->channels);
       else if (is_am824)
@@ -1564,6 +1592,8 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
   int pcm_len = 0;
   int channels = 0;
   int samples = 0;
+  bool ak4619 =
+      ctx->state && ctx->state->config.codec_type == avb_codec_type_ak4619;
 
   if (subtype == avtp_subtype_aaf) {
     aaf_pcm_message_s *aaf_msg = (aaf_pcm_message_s *)avtp_data;
@@ -1581,13 +1611,24 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     iec_61883_6_message_s *iec_msg = (iec_61883_6_message_s *)avtp_data;
     uint16_t stream_data_len =
         (iec_msg->stream_data_len[0] << 8) | iec_msg->stream_data_len[1];
-    if (stream_data_len <= 8)
+    if (stream_data_len <= 8 || stream_data_len > AVTP_STREAM_DATA_PER_MSG ||
+        stream_data_len > (uint16_t)(len - 24))
       return;
     uint8_t dbs = iec_msg->stream_data[1];
+    if (ak4619) {
+      /* IEC 61883-6 AM8-24 listener mode: CIP is mandatory, FMT=AM824 and
+       * SFC=48 kHz. DBS may be 1..8 because the descriptor advertises UT. */
+      if (iec_msg->tag != 1 || iec_msg->stream_data[4] != 0x90 ||
+          (iec_msg->stream_data[5] & 0x07) != cip_sfc_sample_rate_48k ||
+          (iec_msg->stream_data[5] & 0xF8) != 0 || dbs < 1 || dbs > 8)
+        return;
+    }
     channels = dbs;
     if (channels == 0)
       channels = 8;
     int data_bytes = stream_data_len - 8;
+    if ((data_bytes % (channels * 4)) != 0)
+      return;
     samples = data_bytes / (channels * 4);
     pcm_data = iec_msg->stream_data + 8;
     pcm_len = data_bytes;
@@ -1614,8 +1655,6 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     ctx->diag_captured = 1;
   }
 
-  bool ak4619 =
-      ctx->state && ctx->state->config.codec_type == avb_codec_type_ak4619;
   int i2s_channels = ak4619 ? 4 : 2;
   int i2s_bytes_per_sample = ak4619 ? 4 : 3;
 
@@ -1632,13 +1671,16 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
     for (int s = 0; s < samples; s++) {
       for (int ch = 0; ch < i2s_channels; ch++) {
         int src_ch = (ch < channels) ? ch : 0;
-        int src_offset = (s * channels + src_ch) * 4;
+        int src_offset =
+            (subtype == avtp_subtype_61883 && ch >= channels)
+                ? -1
+                : (s * channels + src_ch) * 4;
         uint32_t p0 = (h + offset + 0) & mask;
         uint32_t p1 = (h + offset + 1) & mask;
         uint32_t p2 = (h + offset + 2) & mask;
         uint32_t p3 = (h + offset + 3) & mask;
         if (subtype == avtp_subtype_aaf && ak4619) {
-          if (src_offset + 3 < pcm_len) {
+          if (src_offset >= 0 && src_offset + 3 < pcm_len) {
             rbuf[p0] = pcm_data[src_offset + 3];
             rbuf[p1] = pcm_data[src_offset + 2];
             rbuf[p2] = pcm_data[src_offset + 1];
@@ -1648,7 +1690,7 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
           }
         } else if (subtype == avtp_subtype_aaf) {
           /* AAF: [MSB, MID, LSB, pad] → I2S memory [MSB, MID, LSB] */
-          if (src_offset + 2 < pcm_len) {
+          if (src_offset >= 0 && src_offset + 2 < pcm_len) {
             rbuf[p0] = pcm_data[src_offset + 0];
             rbuf[p1] = pcm_data[src_offset + 1];
             rbuf[p2] = pcm_data[src_offset + 2];
@@ -1656,7 +1698,8 @@ static void avb_stream_rx_handler(uint8_t *avtp_data, uint16_t len,
             rbuf[p0] = rbuf[p1] = rbuf[p2] = 0;
           }
         } else { /* AM824: discard label and retain the significant PCM bits. */
-          if (src_offset + 3 < pcm_len) {
+          if (src_offset >= 0 && src_offset + 3 < pcm_len &&
+              pcm_data[src_offset] == 0x40) {
             if (ak4619) {
               rbuf[p0] = 0;
               rbuf[p1] = pcm_data[src_offset + 3];

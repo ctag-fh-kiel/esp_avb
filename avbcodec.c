@@ -130,7 +130,7 @@ esp_err_t avb_config_i2s(avb_state_s *state) {
   /* Auto-clear stale DMA content so the DAC emits silence on underrun
    * rather than a loop of old samples. */
   chan_cfg.auto_clear = true;
-  /* Small DMA descriptors (6 frames = 1 AAF Class A packet worth,
+  /* Small DMA descriptors (6 frames = 1 AVTP Class A audio packet worth,
    * 125 µs at 48 kHz). 16 of them = 2 ms TX ring — Milan Class A's
    * max_transit_time window. The listener drain in avtp.c runs as an
    * esp_timer 1 ms task that calls i2s_channel_write, so the I2S

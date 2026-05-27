@@ -2284,7 +2284,10 @@ int avb_process_aecp_cmd_set_stream_format(avb_state_s *state,
     }
 
     if (!format_supported) {
-      avberr("AECP Set Stream Format: unsupported format requested");
+      const uint8_t *raw = (const uint8_t *)requested;
+      avberr("AECP Set Stream Format: unsupported format requested "
+             "[%02x %02x %02x %02x %02x %02x %02x %02x]",
+             raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
       status = aecp_status_not_supported;
     } else {
       if (is_output) {

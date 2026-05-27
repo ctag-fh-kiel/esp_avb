@@ -67,7 +67,7 @@ esp_err_t ak4619_set_mic_gain(float db) {
 esp_err_t ak4619_configure(avb_state_s *state, i2c_master_bus_handle_t bus) {
   if (state->config.default_sample_rate != 48000 ||
       state->config.default_bits_per_sample != 32) {
-    ESP_LOGE(TAG, "Only 48 kHz AAF INT32 is supported in TDM128 mode");
+    ESP_LOGE(TAG, "Only 48 kHz local INT32 slots are supported in TDM128 mode");
     return ESP_ERR_NOT_SUPPORTED;
   }
 
