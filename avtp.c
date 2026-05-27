@@ -115,12 +115,12 @@ static uint32_t build_sine_lut(uint8_t **lut_out, int channels, int bit_depth,
   }
 
   float amplitude =
-      (bit_depth == 24) ? 20000.0f : 32767.0f; // quiet: match mic level (~±20k)
+      (bit_depth == 24) ? 4194303.0f : 1073741823.0f; /* -6 dBFS */
   float phase_inc = 2.0f * M_PI * freq / (float)sample_rate;
   float phase = 0.0f;
 
   for (uint32_t i = 0; i < cycle_samples; i++) {
-    int32_t sample = (int32_t)(sinf(phase) * amplitude * 0.7f); // 70% amplitude
+    int32_t sample = (int32_t)(sinf(phase) * amplitude);
 
     for (int ch = 0; ch < channels; ch++) {
       int offset = (i * channels + ch) * stride;
@@ -132,8 +132,10 @@ static uint32_t build_sine_lut(uint8_t **lut_out, int channels, int bit_depth,
         lut[offset + 2] = (sample >> 0) & 0xFF; // LSB
         lut[offset + 3] = 0;                    // padding
       } else {
-        lut[offset + 0] = (sample >> 8) & 0xFF;
-        lut[offset + 1] = (sample >> 0) & 0xFF;
+        lut[offset + 0] = (sample >> 24) & 0xFF;
+        lut[offset + 1] = (sample >> 16) & 0xFF;
+        lut[offset + 2] = (sample >> 8) & 0xFF;
+        lut[offset + 3] = (sample >> 0) & 0xFF;
       }
     }
     phase += phase_inc;
@@ -451,6 +453,24 @@ static uint8_t sample_rate_to_aaf_code(uint32_t sample_rate) {
   }
 }
 
+/* IEC 61883-6 defines SYT_INTERVAL in audio sample periods. AVTP timestamps
+ * are present only in packets containing a data block at this interval. */
+static uint8_t am824_syt_interval_for_rate(uint32_t sample_rate) {
+  switch (sample_rate) {
+  case 88200:
+  case 96000:
+    return 16;
+  case 176400:
+  case 192000:
+    return 32;
+  case 32000:
+  case 44100:
+  case 48000:
+  default:
+    return 8;
+  }
+}
+
 /* AVB Stream output task - generates sine wave and sends as AVTP AAF stream
  *
  * This task generates a sine wave using the esp_codec_dev component (ES8311)
@@ -743,6 +763,8 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t avtp_media_ts = 0;
   uint32_t avtp_ts_increment = (uint32_t)((uint64_t)params->samples_per_packet *
                                           1000000000ULL / params->sample_rate);
+  uint32_t sample_period_ns =
+      (uint32_t)(1000000000ULL / params->sample_rate);
 
   /* Per-window min/max — seeded as INT32_MAX/MIN so the first sample
    * always captures as both ends of the range. Reset by the 1 Hz
@@ -758,8 +780,10 @@ static void avb_stream_out_task(void *task_param) {
   bool drift_ref_valid = false;
   int32_t remaining_ns_min = INT32_MAX, remaining_ns_max = INT32_MIN;
   uint32_t gptp_resync_count = 0;
-  /* Sub-µs carry for the ns→µs truncation in the gPTP-paced scheduler. */
-  int32_t sched_ns_carry = 0;
+  /* Carries retain both the fractional-nanosecond gPTP rate correction and
+   * the sub-microsecond part discarded by esp_timer's scheduling units. */
+  int64_t sched_frac_ns_q16 = 0;
+  int32_t sched_us_carry_ns = 0;
   /* Periodic gPTP-vs-esp_timer resync measurement to produce a filtered
    * per-packet correction. Reading gPTP every packet injected ptpd's
    * 125 ms servo ripple directly into TX cadence; instead we sample
@@ -810,15 +834,20 @@ static void avb_stream_out_task(void *task_param) {
  * consumes exactly one AVTP packet per gPTP-paced interval; continuous I2S
  * refill makes FIFO occupancy reveal whether ADC MCLK is fast or slow. */
   /* Ring size must be a multiple of i2s_read_size (bytes per AVTP packet)
-   * to avoid partial-frame reads at ring wrap boundaries. Eight ms leaves
-   * enough margin for a bounded trim loop without adding large capture delay. */
+   * to avoid partial-frame reads at ring wrap boundaries. Keep four ms of
+   * capacity, but operate at four Class-A packets (0.5 ms at 48 kHz) so
+   * capture plus the default two ms presentation offset stays low while
+   * retaining some scheduling margin before an underrun. */
   int i2s_frame_bytes = i2s_channels * i2s_bytes_per_sample;
-  int i2s_ring_size = (int)(params->sample_rate * i2s_frame_bytes * 8 / 1000);
+  int i2s_ring_size = (int)(params->sample_rate * i2s_frame_bytes * 4 / 1000);
   /* Round down to nearest multiple of i2s_read_size */
   i2s_ring_size -= i2s_ring_size % i2s_read_size;
   if (i2s_ring_size < i2s_read_size * 4)
     i2s_ring_size = i2s_read_size * 4; /* minimum 4 packets */
   int i2s_ring_head = 0, i2s_ring_tail = 0;
+  int i2s_ring_target = i2s_read_size * 4; /* four packets = 0.5 ms Class A */
+  if (i2s_ring_target > i2s_ring_size / 2)
+    i2s_ring_target = i2s_ring_size / 2;
   if (!params->use_sine_wave) {
     i2s_ring = calloc(1, i2s_ring_size);
     if (!i2s_ring) {
@@ -829,7 +858,7 @@ static void avb_stream_out_task(void *task_param) {
      * I2S DMA returns in chunks larger than requested (driver adjusts
      * dma_frame_num), so we fill as much as we can. */
     int frame_size = i2s_channels * i2s_bytes_per_sample;
-    int prefill_target = i2s_ring_size / 2; /* ~4 ms of audio */
+    int prefill_target = i2s_ring_target;
     while (i2s_ring_head < prefill_target) {
       int write_pos = i2s_ring_head % i2s_ring_size;
       int space = prefill_target - i2s_ring_head;
@@ -850,7 +879,6 @@ static void avb_stream_out_task(void *task_param) {
     }
     avbinfo("Stream out: I2S ring pre-filled %d bytes", i2s_ring_head);
   }
-  int i2s_ring_target = i2s_ring_size / 2;
   const int32_t talker_trim_step_q16 = 5 * 65536; /* 5 ppm per 0.5 s max */
   const uint32_t talker_trim_update_packets = 4000;
   const int talker_trim_deadband_packets = 2;
@@ -968,13 +996,18 @@ static void avb_stream_out_task(void *task_param) {
         }
       }
     }
-    /* Per-packet advance: nominal interval plus filtered adjustment,
-     * with sub-µs carry. adj_q16 is ns per packet × 65536. */
-    int64_t base_ns = (int64_t)params->interval * 1000LL;
-    int64_t adj_ns = sched_ns_adj_q16 >> 16;
-    int64_t total_ns = base_ns + adj_ns + sched_ns_carry;
+    /* Per-packet advance: retain the Q16 fraction. Crystal-rate corrections
+     * are normally far below one nanosecond per packet; dropping this
+     * fraction made the talker effectively free-run on esp_timer. */
+    int64_t total_ns_q16 =
+        ((int64_t)params->interval * 1000LL << 16) + sched_ns_adj_q16 +
+        sched_frac_ns_q16;
+    int64_t interval_ns = total_ns_q16 / 65536LL;
+    sched_frac_ns_q16 = total_ns_q16 - interval_ns * 65536LL;
+    int64_t total_ns = interval_ns + sched_us_carry_ns;
     int32_t us_to_wait = (int32_t)(total_ns / 1000);
-    sched_ns_carry = (int32_t)(total_ns - (int64_t)us_to_wait * 1000);
+    sched_us_carry_ns =
+        (int32_t)(total_ns - (int64_t)us_to_wait * 1000);
     if (gptp_cadence_ready) {
       next_send_time += us_to_wait;
     } else if (overrun > params->interval * 10) {
@@ -1048,9 +1081,20 @@ static void avb_stream_out_task(void *task_param) {
       remaining_ns_max = INT32_MIN;
     }
 
-    /* Update per-packet fields in tx_frame.
-     * sv=1 always, tv=1 always, mr per state, tu per gPTP status. */
-    uint8_t hdr1 = 0x81; /* sv=1, version=0, mr=0, tv=1 */
+    /* Update per-packet fields in tx_frame. AAF timestamps identify the
+     * first sample in every packet. For IEC 61883-6, IEEE 1722 timestamps
+     * identify only the data block whose DBC is aligned to SYT_INTERVAL. */
+    uint8_t timestamp_index = 0;
+    bool timestamp_valid = true;
+    if (is_am824) {
+      const uint8_t syt_interval =
+          am824_syt_interval_for_rate(params->sample_rate);
+      timestamp_index =
+          (uint8_t)((syt_interval - (dbc % syt_interval)) % syt_interval);
+      timestamp_valid = timestamp_index < params->samples_per_packet;
+    }
+    uint8_t hdr1 = timestamp_valid ? 0x81 : 0x80;
+    /* sv=1, version=0, mr=0, tv=timestamp_valid */
     if (mcr_hold_remaining > 0) {
       if (mr_state)
         hdr1 |= 0x08; /* mr=1 */
@@ -1065,7 +1109,8 @@ static void avb_stream_out_task(void *task_param) {
     }
     avtp[2] = seq_num++;
     uint32_t presentation_ts =
-        avtp_media_ts + params->presentation_time_offset_ns;
+        avtp_media_ts + params->presentation_time_offset_ns +
+        (uint32_t)timestamp_index * sample_period_ns;
     avtp[12] = (presentation_ts >> 24) & 0xFF;
     avtp[13] = (presentation_ts >> 16) & 0xFF;
     avtp[14] = (presentation_ts >> 8) & 0xFF;
@@ -2426,7 +2471,7 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
     params->sample_rate = aaf_code_to_sample_rate(fmt->aaf_pcm.sample_rate);
   }
 
-  // Audio source: mic input by default, sine wave for testing
+  // Audio source: AK4619 capture by default; sine is enabled only for tests.
   params->use_sine_wave = false;
   params->sine_freq = 1000.0f; // 1 kHz test tone (if sine enabled)
 
