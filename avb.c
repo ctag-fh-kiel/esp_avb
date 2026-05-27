@@ -14,7 +14,6 @@
 #include "esp_codec_dev.h"
 #include "esp_timer.h"
 #include <driver/gpio.h>
-#include <esp_task_wdt.h>
 #include <math.h>
 #include <nvs_flash.h>
 #include <stdio.h>
@@ -977,12 +976,6 @@ static void avb_task(void *task_param) {
   // persisted volume/gain override the codec defaults
   avb_persist_load(state);
 
-  /* Centralized periodic diagnostic (CPU, stream-in, stream-out, MCLK).
-   * Must set the state pointer before starting so the first tick has
-   * access to media_clock data. */
-  avb_cpu_stats_set_state(state);
-  avb_cpu_stats_start();
-
   // Apply persisted codec values to hardware
   if (state->codec_enabled) {
     avb_codec_set_vol(state, state->ctrl_speaker_vol);
@@ -1001,9 +994,8 @@ static void avb_task(void *task_param) {
 
   /* Spin up the deferred NVS writer. Create the snapshot mutex first
    * so avb_persist_request_save() calls from protocol handlers will
-   * take the lock path. Task priority sits well below AVB main (21)
-   * and AVB-OUT (configMAX_PRIORITIES-1) so flash I/O never preempts
-   * time-critical work; pin to core 0 so CPU1 stays free for AVB-OUT. */
+   * take the lock path. Task priority sits below time-critical work;
+   * pin to core 0 so CPU1 remains dedicated to audio. */
   state->persist_mutex = xSemaphoreCreateMutex();
   if (state->persist_mutex == NULL) {
     avberr("Failed to create persist mutex; NVS saves disabled");
@@ -1078,12 +1070,8 @@ int avb_start(avb_config_s *config) {
     return ERROR;
   }
   if (s_state == NULL) {
-    /* Pinned to core 0. AVB-OUT busy-waits at prio 24 on core 1 — any task
-     * at lower prio pinned to core 1 (e.g., if the scheduler happened to
-     * place AVB there on an unpinned xTaskCreate) is permanently starved,
-     * which freezes ATDECC (Hive can't enumerate), MSRP, MAAP, and ADP.
-     * Core 0 has plenty of headroom since emac_rx is driven by IRQs and
-     * AVB-IN only runs when stream packets are queued. */
+    /* Keep discovery, ATDECC, MSRP, MAAP and persistence on core 0.
+     * Core 1 is reserved for AVB-IN playback and AVB-OUT capture/TX. */
     xTaskCreatePinnedToCore(avb_task, "AVB", 16384, (void *)config, 21, NULL,
                             0);
     return OK;

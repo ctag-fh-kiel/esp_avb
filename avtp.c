@@ -13,7 +13,6 @@
 #include "avb.h"
 #include "esp_codec_dev.h"
 #include "esp_log.h"
-#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "freertos/portmacro.h"
 #include <stdatomic.h>
@@ -590,7 +589,6 @@ static void avb_stream_out_task(void *task_param) {
   uint8_t *i2s_buf = NULL;
   uint8_t *i2s_ring = NULL;
   uint8_t *tx_frame = NULL;
-  esp_task_wdt_user_handle_t wdt_handle = NULL;
   struct stream_out_params_s *params = (struct stream_out_params_s *)task_param;
   if (params == NULL)
     goto err;
@@ -759,8 +757,8 @@ static void avb_stream_out_task(void *task_param) {
    * carry sub-nanosecond resolution across packets. */
   int64_t sched_ns_adj_q16 = 0;
 
-  esp_task_wdt_add_user("AVB-OUT", &wdt_handle);
   esp_log_level_set("ptpd", ESP_LOG_NONE);
+  esp_log_level_set("ptpd-late", ESP_LOG_NONE);
   esp_log_level_set("esp.emac", ESP_LOG_NONE);
 
   uint32_t loop_count = 0;
@@ -859,10 +857,10 @@ static void avb_stream_out_task(void *task_param) {
   }
 
   while (!state->output_streams[params->stream_index].stop_streaming) {
-    /* Busy-wait until next send time. Prio 24 on core 1 — nothing else
-     * needs that capacity (emac_rx is unpinned and lands on core 0 when
-     * core 1 spins, AVB-IN is on core 0). Sub-µs precision required for
-     * audio cadence; attempts to switch to a sem+timer approach failed
+    /* Busy-wait until next send time. Runs on core 1 below AVB-IN so local
+     * DAC playback can preempt network talker work in bidirectional use.
+     * Sub-us precision is required for audio cadence; attempts to switch to a
+     * sem+timer approach failed
      * because the esp_timer ISR is masked by portENTER_CRITICAL and its
      * wake latency rose to 400+ µs under AVB-IN load — audible
      * distortion. */
@@ -1127,12 +1125,6 @@ static void avb_stream_out_task(void *task_param) {
 
     loop_count++;
 
-    /* Feed WDT every ~125ms */
-    if (wdt_handle && loop_count % 1000 == 0) {
-      esp_task_wdt_reset_user(wdt_handle);
-    }
-
-
     /* Accumulate productive time for this iteration. Last statement in
      * the loop so it captures everything from work_start_us onward. */
     atomic_fetch_add_explicit(&s_stream_out_work_us,
@@ -1147,7 +1139,6 @@ static void avb_stream_out_task(void *task_param) {
     s_stream_tx_ctx = NULL;
     free(tx_to_free);
   }
-  esp_log_level_set("*", ESP_LOG_INFO);
   avbinfo("Stream out stopped: %lu pkts, %lu fails, %lu overruns (max %lldus), "
           "i2s: %lu zero_reads, %lu nonzero_audio",
           loop_count, send_fail_count, overrun_count, overrun_max,
@@ -1157,9 +1148,6 @@ static void avb_stream_out_task(void *task_param) {
           (long)pll_offset_max);
 
 err:
-  esp_log_level_set("*", ESP_LOG_INFO);
-  if (wdt_handle)
-    esp_task_wdt_delete_user(wdt_handle);
   free(sine_lut);
   free(pcm_buf);
   free(i2s_buf);
@@ -1173,8 +1161,9 @@ err:
  * Stream Input (Listener) — Jitter-buffered AVTP → I2S
  *
  * Architecture:
- *   EMAC RX handler → ring_write (non-blocking)
- *   esp_timer 1ms   → ring_read → i2s_channel_write
+ *   EMAC RX handler      -> ring_write (non-blocking, core 0)
+ *   esp_timer 1 ms       -> task notification only (core 0)
+ *   AVB-IN audio task    -> ring_read -> i2s_channel_write (core 1)
  *
  * The SPSC lock-free ring buffer decouples bursty EMAC packet arrival
  * from steady I2S DMA consumption. Milan-compliant: buffers ≥2.126ms.
@@ -1205,7 +1194,7 @@ err:
 #define STREAM_MAX_PACKET_BYTES   (STREAM_MAX_PACKET_SAMPLES * 2 /*ch*/ * 3 /*bytes*/)
 
 /* Jitter ring buffer — SPSC byte FIFO. Single producer = EMAC RX handler
- * (inline in emac_rx task). Single consumer = drain esp_timer callback.
+ * (inline in emac_rx task). Single consumer = AVB-IN audio task.
  * Capacity MUST be a power of 2 for fast index masking.
  *
  * Sized at 16 KB (~56 ms of 48 kHz stereo 24-bit audio) so that the
@@ -1270,7 +1259,7 @@ static inline uint32_t ring_read(jitter_ring_t *r, uint8_t *dst, uint32_t len) {
 }
 
 /* Stream RX handler context — file-static, accessed by EMAC RX task
- * (handler, producer) and esp_timer task (drain, consumer). Allocated
+ * (handler, producer) and AVB-IN task (drain, consumer). Allocated
  * by avb_start_stream_in. All hot-path counters are plain volatile —
  * the emac_rx handler is the only writer, periodic stats task is the
  * only reader, and word-aligned 32-bit accesses are torn-free on RISC-V. */
@@ -1278,7 +1267,10 @@ typedef struct {
   avb_state_s *state;                        /* for media_clock stats update */
   i2s_chan_handle_t i2s_tx_handle;
   jitter_ring_t ring;                        /* SPSC byte ring, handler→drain */
-  esp_timer_handle_t drain_timer;            /* periodic 1 ms drain */
+  esp_timer_handle_t drain_timer;            /* periodic 1 ms notification */
+  TaskHandle_t drain_task;                   /* core-1 I2S playback task */
+  SemaphoreHandle_t drain_stopped;           /* orderly task shutdown */
+  volatile bool drain_stop;
   uint8_t expected_stream_id[UNIQUE_ID_LEN]; /* filter: only accept this stream */
   /* diagnostics — volatile, handler-writes-only, stats-reads-only */
   volatile uint32_t pkt_count;        /* total stream packets received */
@@ -1296,6 +1288,7 @@ typedef struct {
   uint32_t media_locked_count;
   uint32_t media_unlocked_count;
   bool ever_locked;
+  bool playback_locked;
   volatile int64_t last_packet_us;    /* esp_timer at most recent packet RX */
   /* first-packet snapshot (written by handler, printed by main loop) */
   uint8_t diag_subtype;
@@ -1352,8 +1345,8 @@ bool avb_crf_stream_valid(void) {
          s_crf_rx_ctx->drift_latest_valid;
 }
 
-/* Listener drain — runs in the esp_timer task (prio 22, core 0) every
- * 1 ms. Pulls whatever bytes are available from the jitter ring and
+/* Listener drain work — runs in the AVB-IN task (prio 24, core 1) once
+ * awakened by the 1 ms esp_timer notification. Pulls bytes from the ring and
  * pushes them to I2S TX. The I2S driver paces playout at the DAC rate,
  * so the ring fill level (= playout latency) self-stabilises once the
  * PLL has locked MCLK to the talker's rate.
@@ -1364,8 +1357,7 @@ bool avb_crf_stream_valid(void) {
  *
  * No log prints, no blocking — just ring_read + i2s_channel_write + the
  * PLL byte-counter update. */
-static void stream_in_drain_cb(void *arg) {
-  stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
+static void stream_in_drain_once(stream_rx_ctx_t *ctx) {
   if (!ctx)
     return;
   uint32_t prefill = ctx->state
@@ -1380,11 +1372,10 @@ static void stream_in_drain_cb(void *arg) {
   /* Hold the drain off until the ring has reached the startup prefill.
    * The resulting fill depth becomes the deterministic listener-internal
    * latency from packet arrival to DAC output. */
-  static bool locked = false;
-  if (!locked) {
+  if (!ctx->playback_locked) {
     if (ring_readable(&ctx->ring) < prefill)
       return;
-    locked = true;
+    ctx->playback_locked = true;
     if (!ctx->ever_locked) {
       ctx->ever_locked = true;
     }
@@ -1396,7 +1387,7 @@ static void stream_in_drain_cb(void *arg) {
     ctx->drain_underrun++;
     /* Ring drained — probably lost stream. Next packet arrival will
      * rebuild to prefill before draining resumes. */
-    locked = false;
+    ctx->playback_locked = false;
     if (ctx->ever_locked) {
       ctx->media_unlocked_count++;
       ctx->ever_locked = false;
@@ -1449,6 +1440,26 @@ static void stream_in_drain_cb(void *arg) {
     atomic_fetch_add_explicit(&ctx->state->media_clock.i2s_bytes_written,
                               (uint64_t)bytes_written, memory_order_relaxed);
   }
+}
+
+/* Timer-service context remains on core 0 and must do no audio work. */
+static void stream_in_drain_notify_cb(void *arg) {
+  stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
+  if (ctx && ctx->drain_task) {
+    xTaskNotifyGive(ctx->drain_task);
+  }
+}
+
+static void stream_in_drain_task(void *arg) {
+  stream_rx_ctx_t *ctx = (stream_rx_ctx_t *)arg;
+  while (!ctx->drain_stop) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (!ctx->drain_stop) {
+      stream_in_drain_once(ctx);
+    }
+  }
+  xSemaphoreGive(ctx->drain_stopped);
+  vTaskDelete(NULL);
 }
 
 /* CRF stream RX handler — counts CRF AVTPDUs and records the most recent
@@ -2056,11 +2067,24 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   atomic_store(&ctx->ring.head, 0);
   atomic_store(&ctx->ring.tail, 0);
 
-  /* Create the drain timer — fires every 1 ms, reads from ring, writes
-   * to I2S TX. Runs in the esp_timer task (prio 22, core 0). Fast
-   * callback (~2-10 µs typical) so it doesn't perturb anything. */
+  /* Create the core-1 audio drain task first. The esp_timer callback only
+   * wakes it; all I2S writes are kept off core 0 with PTP/control/logging. */
+  ctx->drain_stopped = xSemaphoreCreateBinary();
+  if (!ctx->drain_stopped ||
+      xTaskCreatePinnedToCore(stream_in_drain_task, "AVB-IN", 4096, ctx,
+                              configMAX_PRIORITIES - 1, &ctx->drain_task,
+                              1) != pdPASS) {
+    avberr("Stream in: failed to create audio drain task");
+    if (ctx->drain_stopped)
+      vSemaphoreDelete(ctx->drain_stopped);
+    free(ctx->ring.buf);
+    free(ctx);
+    return ERROR;
+  }
+
+  /* Fire every 1 ms, but do only a task notification on core 0. */
   const esp_timer_create_args_t drain_args = {
-      .callback = stream_in_drain_cb,
+      .callback = stream_in_drain_notify_cb,
       .arg = ctx,
       .dispatch_method = ESP_TIMER_TASK,
       .name = "stream-in-drain",
@@ -2068,6 +2092,10 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   };
   if (esp_timer_create(&drain_args, &ctx->drain_timer) != ESP_OK) {
     avberr("Stream in: failed to create drain timer");
+    ctx->drain_stop = true;
+    xTaskNotifyGive(ctx->drain_task);
+    xSemaphoreTake(ctx->drain_stopped, portMAX_DELAY);
+    vSemaphoreDelete(ctx->drain_stopped);
     free(ctx->ring.buf);
     free(ctx);
     return ERROR;
@@ -2075,6 +2103,10 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
   if (esp_timer_start_periodic(ctx->drain_timer, 1000) != ESP_OK) {
     avberr("Stream in: failed to start drain timer");
     esp_timer_delete(ctx->drain_timer);
+    ctx->drain_stop = true;
+    xTaskNotifyGive(ctx->drain_task);
+    xSemaphoreTake(ctx->drain_stopped, portMAX_DELAY);
+    vSemaphoreDelete(ctx->drain_stopped);
     free(ctx->ring.buf);
     free(ctx);
     return ERROR;
@@ -2088,12 +2120,13 @@ int avb_start_stream_in(avb_state_s *state, uint16_t index) {
    * once the 8 kHz audio stream is active. Keep aggregate AVB diagnostics,
    * but silence chatty driver/PTP tags while receiving media. */
   esp_log_level_set("ptpd", ESP_LOG_NONE);
+  esp_log_level_set("ptpd-late", ESP_LOG_NONE);
   esp_log_level_set("esp.emac", ESP_LOG_NONE);
 
   /* Register the shared dispatcher — routes to audio stream input or CRF by stream_id */
   avb_net_set_stream_rx_handler(avb_stream_rx_dispatcher, NULL);
 
-  avbinfo("Stream in started (ring=%lu B, prefill=%lu B, 1 ms drain)",
+  avbinfo("Stream in started (ring=%lu B, prefill=%lu B, AVB-IN core 1)",
           (unsigned long)ring_size, (unsigned long)prefill);
   return OK;
 }
@@ -2138,6 +2171,10 @@ void avb_stop_stream_in(avb_state_s *state, uint16_t index) {
       esp_timer_stop(ctx_to_free->drain_timer);
       esp_timer_delete(ctx_to_free->drain_timer);
     }
+    ctx_to_free->drain_stop = true;
+    xTaskNotifyGive(ctx_to_free->drain_task);
+    xSemaphoreTake(ctx_to_free->drain_stopped, portMAX_DELAY);
+    vSemaphoreDelete(ctx_to_free->drain_stopped);
 
     avbinfo("Stream in stopped: pkts=%lu ok=%lu fail=%lu drain=%lu under=%lu "
             "id_skip=%lu seq_gap=%lu locked=%lu/%lu",
@@ -2291,7 +2328,7 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
     state->output_streams[index].stop_streaming = false;
     state->output_streams[index].streaming = true;
     xTaskCreatePinnedToCore(avb_crf_stream_out_task, "AVB-CRF-OUT", 4096,
-                            (void *)params, configMAX_PRIORITIES - 2, NULL, 1);
+                            (void *)params, configMAX_PRIORITIES - 3, NULL, 1);
     return OK;
   }
 
@@ -2331,7 +2368,7 @@ int avb_start_stream_out(avb_state_s *state, uint16_t index) {
   state->output_streams[index].stop_streaming = false;
   state->output_streams[index].streaming = true;
   xTaskCreatePinnedToCore(avb_stream_out_task, "AVB-OUT", 8192, (void *)params,
-                          configMAX_PRIORITIES - 1, NULL, 1);
+                          configMAX_PRIORITIES - 2, NULL, 1);
 
   avbinfo("Stream out %d started: %s -> AVTP %s", index,
           params->use_sine_wave ? "sine wave" : "mic input",
