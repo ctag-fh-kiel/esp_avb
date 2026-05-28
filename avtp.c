@@ -772,38 +772,14 @@ static void avb_stream_out_task(void *task_param) {
   int32_t pll_offset_max = INT32_MIN, pll_offset_min = INT32_MAX;
   uint32_t pll_measure_count = 0, pll_skip_count = 0;
 
-  /* gPTP-cadence drift tracking — each publish cycle computes the
-   * gPTP-vs-esp_timer rate ratio over the elapsed window. Tells us
-   * how much the gPTP-paced scheduler is actually correcting for. */
+  /* gPTP-vs-esp_timer drift tracking for diagnostics only. The transmit
+   * scheduler remains esp_timer-paced; feeding gPTP servo noise back into
+   * the packet cadence caused slow audible phasing on some listeners. */
   int64_t drift_gptp_ref_ns = 0;
   int64_t drift_esp_ref_us = 0;
   bool drift_ref_valid = false;
   int32_t remaining_ns_min = INT32_MAX, remaining_ns_max = INT32_MIN;
   uint32_t gptp_resync_count = 0;
-  /* Carries retain both the fractional-nanosecond gPTP rate correction and
-   * the sub-microsecond part discarded by esp_timer's scheduling units. */
-  int64_t sched_frac_ns_q16 = 0;
-  int32_t sched_us_carry_ns = 0;
-  /* Periodic gPTP-vs-esp_timer resync measurement to produce a filtered
-   * per-packet correction. Reading gPTP every packet injected ptpd's
-   * 125 ms servo ripple directly into TX cadence; instead we sample
-   * gPTP every ~128 ms (SCHED_RESYNC_PKTS packets) and smoothly adjust
-   * a correction-per-packet in nanoseconds. Between samples the cadence
-   * is pure esp_timer-paced with a filtered ppm offset applied. */
-  #define SCHED_RESYNC_PKTS 8192    /* ~1 s between gPTP baselines —
-                                       each sample covers a full ptpd
-                                       servo cycle, reducing per-sample
-                                       noise before it enters the EMA. */
-  #define SCHED_FILTER_SHIFT 3      /* EMA tau ≈ 8 samples × 1 s = ~8 s
-                                       effective smoothing on a low-noise
-                                       per-sample measurement. */
-  int64_t sched_gptp_ref_ns = 0;
-  int64_t sched_esp_ref_us = 0;
-  bool sched_ref_valid = false;
-  /* per-packet correction in nanoseconds, signed. Positive = wait a bit
-   * longer each packet (ESP crystal fast). Q16 fixed-point so we can
-   * carry sub-nanosecond resolution across packets. */
-  int64_t sched_ns_adj_q16 = 0;
 
   esp_log_level_set("ptpd", ESP_LOG_NONE);
   esp_log_level_set("ptpd-late", ESP_LOG_NONE);
@@ -879,9 +855,11 @@ static void avb_stream_out_task(void *task_param) {
     }
     avbinfo("Stream out: I2S ring pre-filled %d bytes", i2s_ring_head);
   }
-  const int32_t talker_trim_step_q16 = 5 * 65536; /* 5 ppm per 0.5 s max */
-  const uint32_t talker_trim_update_packets = 4000;
-  const int talker_trim_deadband_packets = 2;
+  const int32_t talker_trim_step_q16 = 1 * 65536; /* 1 ppm per update */
+  const uint32_t talker_trim_update_packets = 8000; /* 1 s at Class A */
+  const int talker_trim_deadband_packets = 4;
+  const int talker_trim_confirm_windows = 3;
+  int talker_trim_bias = 0;
 
   /* Sample PTP and send-time as late as possible — all logging and pre-fill
    * is done.  This ensures the first packet's presentation timestamp is
@@ -895,11 +873,10 @@ static void avb_stream_out_task(void *task_param) {
   int64_t phase_offset = (mac_hash % params->interval);
   int64_t next_send_time = esp_timer_get_time() + phase_offset;
 
-  /* gPTP-paced cadence: each packet's busy-wait target is re-projected
-   * from the current gPTP time. Locks TX rate to gPTP (8000 packets per
-   * gPTP-second) rather than to ESP's crystal, preventing cumulative
-   * sample-count drift that causes listeners to drop/dup samples. */
-  bool gptp_cadence_ready = false;
+  /* Keep the TX cadence purely esp_timer-paced. The media timestamp is
+   * seeded from gPTP below, then advanced by the nominal sample count.
+   * Applying a once-per-second gPTP-vs-esp_timer cadence correction fed PTP
+   * servo noise into packet spacing and caused slow audible phasing. */
   for (int init_try = 0; init_try < 5; init_try++) {
     struct timespec ptp_a, ptp_b;
     if (ptpd_now(&ptp_a) == 0 &&
@@ -911,7 +888,9 @@ static void avb_stream_out_task(void *task_param) {
       int64_t diff = (int64_t)(ts_b - ts_a);
       if (diff >= 0 && diff < 500000) {
         avtp_media_ts = (uint32_t)ts_a;
-        gptp_cadence_ready = true;
+        drift_gptp_ref_ns = (int64_t)ts_a;
+        drift_esp_ref_us = esp_timer_get_time();
+        drift_ref_valid = true;
         break;
       }
     }
@@ -941,85 +920,13 @@ static void avb_stream_out_task(void *task_param) {
       if (overrun > overrun_max)
         overrun_max = overrun;
     }
-    /* Filtered gPTP cadence: most packets advance by (interval_ns +
-     * sched_ns_adj) with Q16-fixed-point carry to preserve sub-ns
-     * precision. Every SCHED_RESYNC_PKTS packets we read gPTP, measure
-     * how far off our free-running esp_timer schedule has slipped, and
-     * update sched_ns_adj via an EMA. Result: esp_timer-precision
-     * cadence with a heavily-filtered rate lock to gPTP. */
-    if (gptp_cadence_ready && (loop_count & (SCHED_RESYNC_PKTS - 1)) == 0) {
-      struct timespec ts_now;
-      if (ptpd_now(&ts_now) == 0) {
-        int64_t now_gptp_ns = (int64_t)ts_now.tv_sec * 1000000000LL +
-                              (int64_t)ts_now.tv_nsec;
-        if (!sched_ref_valid) {
-          sched_gptp_ref_ns = now_gptp_ns;
-          sched_esp_ref_us = now;
-          sched_ref_valid = true;
-          drift_gptp_ref_ns = now_gptp_ns;
-          drift_esp_ref_us = now;
-          drift_ref_valid = true;
-        } else {
-          int64_t gptp_delta = now_gptp_ns - sched_gptp_ref_ns;
-          int64_t esp_delta_us = now - sched_esp_ref_us;
-          int64_t esp_delta_ns = esp_delta_us * 1000LL;
-          /* Guard against bogus intervals (first tick / gPTP jump). */
-          if (esp_delta_us > 10000 && esp_delta_us < 10000000) {
-            int64_t diff_ns = gptp_delta - esp_delta_ns;
-            /* Per-packet correction = accumulated diff over SCHED_RESYNC_PKTS.
-             * Q16 so sub-ns survives. */
-            int64_t sample_q16 = (diff_ns << 16) / SCHED_RESYNC_PKTS;
-            /* Large jump: re-baseline without polluting the filter. */
-            int64_t thresh_ns_per_pkt_q16 = (int64_t)1000 << 16; /* 1 µs */
-            if (sample_q16 > thresh_ns_per_pkt_q16 ||
-                sample_q16 < -thresh_ns_per_pkt_q16) {
-              gptp_resync_count++;
-              sched_ns_adj_q16 = 0;
-            } else {
-              /* EMA: new = (old*(2^K-1) + sample) >> K */
-              sched_ns_adj_q16 =
-                  ((sched_ns_adj_q16 *
-                    ((1 << SCHED_FILTER_SHIFT) - 1)) +
-                   sample_q16) >>
-                  SCHED_FILTER_SHIFT;
-            }
-            /* Track remaining_ns-like stat for diagnostics: the
-             * accumulated diff is the slip over the sample window. */
-            if (diff_ns >= (int64_t)INT32_MIN && diff_ns <= (int64_t)INT32_MAX) {
-              int32_t diff32 = (int32_t)diff_ns;
-              if (diff32 < remaining_ns_min) remaining_ns_min = diff32;
-              if (diff32 > remaining_ns_max) remaining_ns_max = diff32;
-            }
-          }
-          sched_gptp_ref_ns = now_gptp_ns;
-          sched_esp_ref_us = now;
-        }
-      }
-    }
-    /* Per-packet advance: retain the Q16 fraction. Crystal-rate corrections
-     * are normally far below one nanosecond per packet; dropping this
-     * fraction made the talker effectively free-run on esp_timer. */
-    int64_t total_ns_q16 =
-        ((int64_t)params->interval * 1000LL << 16) + sched_ns_adj_q16 +
-        sched_frac_ns_q16;
-    int64_t interval_ns = total_ns_q16 / 65536LL;
-    sched_frac_ns_q16 = total_ns_q16 - interval_ns * 65536LL;
-    int64_t total_ns = interval_ns + sched_us_carry_ns;
-    int32_t us_to_wait = (int32_t)(total_ns / 1000);
-    sched_us_carry_ns =
-        (int32_t)(total_ns - (int64_t)us_to_wait * 1000);
-    if (gptp_cadence_ready) {
-      next_send_time += us_to_wait;
-    } else if (overrun > params->interval * 10) {
+    if (overrun > params->interval * 10) {
       next_send_time = now + params->interval;
     } else {
       next_send_time += params->interval;
     }
 
-    /* Advance AVTP media clock by exact nominal increment. TX cadence
-     * is gPTP-paced by the filtered scheduler above, so our counter
-     * tracks gPTP rate correctly without per-packet clock_gettime
-     * jitter leaking into presentation timestamps. */
+    /* Advance AVTP media clock by exact nominal sample count. */
     avtp_media_ts += avtp_ts_increment;
 
     /* Check for gPTP grandmaster change every ~1 second (8000 packets at 125us) */
@@ -1191,10 +1098,26 @@ static void avb_stream_out_task(void *task_param) {
           (loop_count % talker_trim_update_packets) == 0) {
         int fill_error = ring_avail - i2s_ring_target;
         if (fill_error > talker_trim_deadband_packets * i2s_read_size) {
-          avb_pll_adjust_talker_trim(state, -talker_trim_step_q16);
+          if (talker_trim_bias > 0)
+            talker_trim_bias++;
+          else
+            talker_trim_bias = 1;
+          if (talker_trim_bias >= talker_trim_confirm_windows) {
+            avb_pll_adjust_talker_trim(state, -talker_trim_step_q16);
+            talker_trim_bias = 0;
+          }
         } else if (fill_error <
                    -talker_trim_deadband_packets * i2s_read_size) {
-          avb_pll_adjust_talker_trim(state, talker_trim_step_q16);
+          if (talker_trim_bias < 0)
+            talker_trim_bias--;
+          else
+            talker_trim_bias = -1;
+          if (talker_trim_bias <= -talker_trim_confirm_windows) {
+            avb_pll_adjust_talker_trim(state, talker_trim_step_q16);
+            talker_trim_bias = 0;
+          }
+        } else {
+          talker_trim_bias = 0;
         }
       }
       if (ak4619 && is_am824)
