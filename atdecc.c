@@ -296,6 +296,14 @@ int avb_send_aecp_rsp_read_descr_configuration(avb_state_s *state,
   // counts. Eventually, the entire entity model should probably be stored in
   // state. Talker-only endpoints still expose one STREAM_INPUT for CRF media
   // clock, so include STREAM_INPUT whenever num_input_streams is non-zero.
+  /* descriptor_counts enumerates only top-level descriptors per
+   * IEEE 1722.1 section 7.2.2. Nested descriptors are reached through the
+   * parent's base+count fields and are not listed here:
+   *   STRINGS                     via LOCALE.base_strings / number_of_strings
+   *   STREAM_PORT_INPUT/OUTPUT    via AUDIO_UNIT.base_*_port / number_of_*_ports
+   *   AUDIO_CLUSTER / AUDIO_MAP   via STREAM_PORT.base_cluster / base_map
+   *   per-port CONTROLs           via STREAM_PORT.base_control / number_of_controls
+   */
   uint16_t descriptors[AEM_MAX_NUM_DESC];
   int i = 0;
   descriptors[i++] = aem_desc_type_audio_unit;
@@ -857,7 +865,11 @@ int avb_send_aecp_rsp_read_descr_audio_cluster(avb_state_s *state,
 
   // data for the stream input descriptor
   int localized_description = 2; // strings desc 0, string_1
-  aem_desc_type_t signal_type = aem_desc_type_invalid;
+  /* signal_type/signal_index name the cluster's audio source. The input
+   * cluster receives from STREAM_INPUT 0; the output cluster is sourced by
+   * AUDIO_UNIT 0. Some strict controllers reject aem_desc_type_invalid here. */
+  aem_desc_type_t signal_type = aem_desc_type_stream_input;
+  uint16_t signal_index = 0;
   uint16_t num_channels = state->config.input_channels_usable;
   if (msg->descriptor_index[1] == 1) { // index 1 used for output port
     localized_description = 3;         // strings desc 0, string_2
@@ -876,6 +888,7 @@ int avb_send_aecp_rsp_read_descr_audio_cluster(avb_state_s *state,
   int_to_octets(&cluster_format, descriptor.format, 2);
   int_to_octets(&num_channels, descriptor.channel_count, 2);
   int_to_octets(&signal_type, descriptor.signal_type, 2);
+  int_to_octets(&signal_index, descriptor.signal_index, 2);
 
   // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_audio_cluster_desc_s));
@@ -931,9 +944,12 @@ int avb_send_aecp_rsp_read_descr_audio_map(avb_state_s *state,
   // insert the descriptor into the response message
   memcpy(msg->descriptor_data, &descriptor, sizeof(aem_audio_map_desc_s));
 
-  // calc control data length
+  /* Trim unused mapping slots so the descriptor length matches
+   * 8 * number_of_mappings. Strict controllers may cross-check the descriptor
+   * length against the advertised mapping count. */
   uint16_t control_data_len =
-      AECP_DESC_PREAMBLE_LEN + sizeof(aem_audio_map_desc_s);
+      AECP_DESC_PREAMBLE_LEN + sizeof(aem_audio_map_desc_s) -
+      sizeof(aem_audio_mapping_s) * (AEM_MAX_NUM_MAPPINGS - num_mappings);
 
   // set the control data length
   msg->common.header.control_data_len_h = (control_data_len >> 8) & 0xFF;
