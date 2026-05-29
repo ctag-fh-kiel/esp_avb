@@ -537,6 +537,7 @@ void avb_pll_tick(avb_state_s *state) {
   if (now_us >= s_pll.next_correction_us &&
       (cumul_ppm_q16 > AVB_PLL_CORRECTION_DEADBAND_Q16 ||
        cumul_ppm_q16 < -AVB_PLL_CORRECTION_DEADBAND_Q16)) {
+#if CONFIG_ESP_AVB_SUPPRESS_TALKER_MCLK_CORRECTION
     if (has_active_talker_stream(state)) {
       /* Still measure the listener/media-clock error, but keep the hardware
        * clock fixed while the talker owns the shared AK4619 MCLK. Resetting
@@ -553,6 +554,7 @@ void avb_pll_tick(avb_state_s *state) {
       s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
       return;
     }
+#endif
 
     /* Accumulate the per-cycle error into the integrator. Random
      * measurement noise averages toward zero over many cycles; any

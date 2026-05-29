@@ -97,6 +97,58 @@ menu "AVB Configuration"
             disabled, ESP-AVB will not switch its public AVB Lite status on even
             if PTP is running in standard profile.
 
+    menu "Talker Clock and Capture Recovery"
+        depends on ESP_AVB
+
+        config ESP_AVB_SUPPRESS_TALKER_MCLK_CORRECTION
+            bool "Suppress MCLK correction while talker streams are active"
+            default y
+            help
+                Keep the shared AK4619/I2S MCLK fixed while any talker stream
+                is connected. Live APLL retuning during ADC capture was observed
+                to cause delayed ringing/modem-like artefacts and recurring
+                stereo pops on the ESP32-P4 AK4619 setup. Listener-only clock
+                recovery can still retune MCLK when no talker is active.
+
+        config ESP_AVB_TALKER_FLUSH_STALE_I2S_RX
+            bool "Flush stale I2S RX data when starting talker stream"
+            default y
+            help
+                Drain queued I2S RX DMA buffers before pre-filling the talker
+                capture FIFO. This prevents old ADC samples from creating an
+                unexpectedly high FIFO level when AVTP streaming starts.
+
+        config ESP_AVB_TALKER_I2S_RX_FLUSH_READS
+            int "Maximum stale I2S RX reads to flush"
+            default 32
+            range 0 128
+            depends on ESP_AVB_TALKER_FLUSH_STALE_I2S_RX
+            help
+                Maximum number of non-blocking I2S RX reads attempted during
+                talker stream startup. Set to 0 to keep the flush feature
+                compiled in but inactive.
+
+        config ESP_AVB_TALKER_CAPTURE_RATE_MATCH
+            bool "Enable talker capture FIFO rate matching"
+            default y
+            help
+                When the fixed ADC MCLK drifts against the AVTP packet cadence,
+                gently insert or drop one captured audio frame using linear
+                interpolation instead of letting the capture FIFO hit a hard
+                underrun or overrun.
+
+        config ESP_AVB_TALKER_CAPTURE_RATE_MATCH_MIN_INTERVAL_MS
+            int "Minimum interval between capture rate corrections (ms)"
+            default 200
+            range 20 2000
+            depends on ESP_AVB_TALKER_CAPTURE_RATE_MATCH
+            help
+                Lower values correct FIFO drift more aggressively but may make
+                the correction itself easier to hear. The AK4619 lab setup has
+                been tested with the default 200 ms interval.
+
+    endmenu
+
     # ----------------------------------------------------------------
     # Per-port topology — derived from esp_ptp's taxonomy.
     #

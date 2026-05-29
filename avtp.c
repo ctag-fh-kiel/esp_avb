@@ -72,9 +72,74 @@ typedef struct {
   volatile int32_t remaining_ns_min; /* narrowest gPTP-vs-target gap this window */
   volatile int32_t remaining_ns_max; /* widest gPTP-vs-target gap this window */
   volatile uint32_t gptp_resync_count; /* sanity-branch re-seeds (gPTP jumps) */
+  volatile uint32_t capture_drop_count; /* one-frame capture rate corrections */
+  volatile uint32_t capture_insert_count;
 } stream_tx_ctx_t;
 
 static stream_tx_ctx_t *s_stream_tx_ctx = NULL;
+
+static int32_t load_i2s32_le(const uint8_t *p) {
+  return (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                   ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+}
+
+static void store_i2s32_le(uint8_t *p, int32_t v) {
+  uint32_t u = (uint32_t)v;
+  p[0] = (uint8_t)(u & 0xff);
+  p[1] = (uint8_t)((u >> 8) & 0xff);
+  p[2] = (uint8_t)((u >> 16) & 0xff);
+  p[3] = (uint8_t)((u >> 24) & 0xff);
+}
+
+/* Resample a tiny AK4619 TDM packet by one frame when the capture FIFO slowly
+ * drifts away from its target. This avoids abrupt FIFO underrun/overrun
+ * artefacts without retuning the shared MCLK while the ADC is active. */
+static void resample_i2s32_linear(const uint8_t *in, int in_frames,
+                                  uint8_t *out, int out_frames,
+                                  int channels) {
+  if (in_frames <= 0 || out_frames <= 0 || channels <= 0)
+    return;
+
+  if (in_frames == 1 || out_frames == 1) {
+    memcpy(out, in, (size_t)channels * 4);
+    return;
+  }
+
+  const int in_frame_bytes = channels * 4;
+  const int out_frame_bytes = channels * 4;
+  const int denom = out_frames - 1;
+  for (int out_frame = 0; out_frame < out_frames; out_frame++) {
+    int pos_num = out_frame * (in_frames - 1);
+    int base = pos_num / denom;
+    int frac = pos_num % denom;
+    int next = base + 1;
+    if (next >= in_frames)
+      next = in_frames - 1;
+
+    const uint8_t *a = in + base * in_frame_bytes;
+    const uint8_t *b = in + next * in_frame_bytes;
+    uint8_t *dst = out + out_frame * out_frame_bytes;
+    for (int ch = 0; ch < channels; ch++) {
+      int32_t av = load_i2s32_le(a + ch * 4);
+      int32_t bv = load_i2s32_le(b + ch * 4);
+      int64_t mixed = (int64_t)av * (denom - frac) + (int64_t)bv * frac;
+      store_i2s32_le(dst + ch * 4, (int32_t)(mixed / denom));
+    }
+  }
+}
+
+static void ring_read_bytes(const uint8_t *ring, int ring_size, int *tail,
+                            uint8_t *dst, int bytes) {
+  int read_pos = *tail % ring_size;
+  int first = ring_size - read_pos;
+  if (first >= bytes) {
+    memcpy(dst, ring + read_pos, bytes);
+  } else {
+    memcpy(dst, ring + read_pos, first);
+    memcpy(dst + first, ring, bytes - first);
+  }
+  *tail += bytes;
+}
 
 /* Note: Ethernet MAC DMA transmit is accessed concurrently by the AVTP stream
  * task (core 1) and the PTP daemon (core 0). The ESP-IDF driver lacks internal
@@ -639,6 +704,7 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t lut_pos = 0;
   uint8_t *pcm_buf = NULL;
   uint8_t *i2s_buf = NULL;
+  uint8_t *i2s_resample_buf = NULL;
   uint8_t *i2s_ring = NULL;
   uint8_t *tx_frame = NULL;
   struct stream_out_params_s *params = (struct stream_out_params_s *)task_param;
@@ -656,13 +722,21 @@ static void avb_stream_out_task(void *task_param) {
    * INT32. Legacy codecs expose stereo 24-bit slots. */
   int i2s_channels = ak4619 ? 4 : 2;
   int i2s_bytes_per_sample = ak4619 ? 4 : 3;
+  int i2s_frame_bytes = i2s_channels * i2s_bytes_per_sample;
   int i2s_read_size =
       params->samples_per_packet * i2s_channels * i2s_bytes_per_sample;
 
-  i2s_buf = calloc(1, i2s_read_size);
+  i2s_buf = calloc(1, i2s_read_size + i2s_frame_bytes);
   if (!i2s_buf) {
     avberr("Stream out: no memory for I2S buffer");
     goto err;
+  }
+  if (ak4619) {
+    i2s_resample_buf = calloc(1, i2s_read_size);
+    if (!i2s_resample_buf) {
+      avberr("Stream out: no memory for capture rate-match buffer");
+      goto err;
+    }
   }
 
   /* Sine wave fallback */
@@ -824,7 +898,6 @@ static void avb_stream_out_task(void *task_param) {
    * capacity, but operate at four Class-A packets (0.5 ms at 48 kHz) so
    * capture plus the default two ms presentation offset stays low while
    * retaining some scheduling margin before an underrun. */
-  int i2s_frame_bytes = i2s_channels * i2s_bytes_per_sample;
   int i2s_ring_size = (int)(params->sample_rate * i2s_frame_bytes * 4 / 1000);
   /* Round down to nearest multiple of i2s_read_size */
   i2s_ring_size -= i2s_ring_size % i2s_read_size;
@@ -834,12 +907,38 @@ static void avb_stream_out_task(void *task_param) {
   int i2s_ring_target = i2s_read_size * 4; /* four packets = 0.5 ms Class A */
   if (i2s_ring_target > i2s_ring_size / 2)
     i2s_ring_target = i2s_ring_size / 2;
+  const bool capture_rate_match = ak4619 && !params->use_sine_wave &&
+                                  i2s_bytes_per_sample == 4 &&
+                                  params->samples_per_packet > 1 &&
+                                  CONFIG_ESP_AVB_TALKER_CAPTURE_RATE_MATCH;
+  const int capture_low_threshold = i2s_ring_target - i2s_read_size;
+  const int capture_high_threshold = i2s_ring_target + i2s_read_size;
+  int64_t next_capture_slip_us = 0;
+  uint32_t capture_drop_count = 0;
+  uint32_t capture_insert_count = 0;
   if (!params->use_sine_wave) {
     i2s_ring = calloc(1, i2s_ring_size);
     if (!i2s_ring) {
       avberr("Stream out: no memory for I2S ring");
       goto err;
     }
+    /* The codec/I2S RX side may have been running before AVTP streaming is
+     * connected. Drain stale DMA data first so the low-latency capture FIFO
+     * starts near its target instead of immediately absorbing old backlog. */
+#if CONFIG_ESP_AVB_TALKER_FLUSH_STALE_I2S_RX
+    int flush_reads = 0;
+    for (; flush_reads < CONFIG_ESP_AVB_TALKER_I2S_RX_FLUSH_READS;
+         flush_reads++) {
+      size_t flushed = 0;
+      i2s_channel_read(params->i2s_rx_handle, i2s_buf, i2s_read_size, &flushed,
+                       0);
+      if (flushed == 0)
+        break;
+    }
+    if (flush_reads > 0)
+      avbinfo("Stream out: flushed %d stale I2S RX buffers", flush_reads);
+#endif
+
     /* Pre-fill the I2S ring with blocking reads to establish buffer level.
      * I2S DMA returns in chunks larger than requested (driver adjusts
      * dma_frame_num), so we fill as much as we can. */
@@ -985,6 +1084,8 @@ static void avb_stream_out_task(void *task_param) {
         tx_ctx->capture_ring_size = i2s_ring_size;
         tx_ctx->capture_ring_target = i2s_ring_target;
         tx_ctx->capture_packet_bytes = i2s_read_size;
+        tx_ctx->capture_drop_count = capture_drop_count;
+        tx_ctx->capture_insert_count = capture_insert_count;
         tx_ctx->pll_offset_min_ns = pll_offset_min;
         tx_ctx->pll_offset_max_ns = pll_offset_max;
         tx_ctx->pll_skip_count = pll_skip_count;
@@ -1086,18 +1187,46 @@ static void avb_stream_out_task(void *task_param) {
          * count true emitted silence below instead. */
         ring_avail = i2s_ring_head - i2s_ring_tail;
       }
-      /* Consume i2s_read_size bytes from ring */
-      if (ring_avail >= i2s_read_size) {
-        int read_pos = i2s_ring_tail % i2s_ring_size;
-        int first = i2s_ring_size - read_pos;
-        if (first >= i2s_read_size) {
-          memcpy(i2s_buf, i2s_ring + read_pos, i2s_read_size);
-        } else {
-          memcpy(i2s_buf, i2s_ring + read_pos, first);
-          memcpy(i2s_buf + first, i2s_ring, i2s_read_size - first);
+      /* Consume one packet from the capture ring. When the fixed MCLK drifts
+       * against the AVTP cadence, gently insert/drop one ADC frame in a packet
+       * instead of letting the FIFO hit a hard underrun or overrun. */
+      int consume_bytes = i2s_read_size;
+      int output_bytes = i2s_read_size;
+      bool resample_capture = false;
+      bool can_slip = capture_rate_match &&
+                      work_start_us >= next_capture_slip_us;
+      if (can_slip && ring_avail > capture_high_threshold &&
+          ring_avail >= i2s_read_size + i2s_frame_bytes) {
+        consume_bytes = i2s_read_size + i2s_frame_bytes;
+        resample_capture = true;
+      } else if (can_slip && ring_avail < capture_low_threshold &&
+                 ring_avail >= i2s_read_size - i2s_frame_bytes) {
+        consume_bytes = i2s_read_size - i2s_frame_bytes;
+        resample_capture = true;
+      }
+
+      if (ring_avail >= consume_bytes) {
+        ring_read_bytes(i2s_ring, i2s_ring_size, &i2s_ring_tail, i2s_buf,
+                        consume_bytes);
+        if (resample_capture) {
+          int consume_frames = consume_bytes / i2s_frame_bytes;
+          if (consume_frames > params->samples_per_packet) {
+            resample_i2s32_linear(i2s_buf, consume_frames, i2s_buf,
+                                  params->samples_per_packet, i2s_channels);
+            capture_drop_count++;
+          } else {
+            resample_i2s32_linear(i2s_buf, consume_frames,
+                                  i2s_resample_buf,
+                                  params->samples_per_packet, i2s_channels);
+            memcpy(i2s_buf, i2s_resample_buf, output_bytes);
+            capture_insert_count++;
+          }
+          next_capture_slip_us =
+              work_start_us +
+              (int64_t)CONFIG_ESP_AVB_TALKER_CAPTURE_RATE_MATCH_MIN_INTERVAL_MS *
+                  1000;
         }
-        i2s_ring_tail += i2s_read_size;
-        ring_avail -= i2s_read_size;
+        ring_avail -= consume_bytes;
       } else {
         memset(i2s_buf, 0, i2s_read_size); /* underrun — silence */
         i2s_zero_reads++;
@@ -1181,6 +1310,7 @@ err:
   free(sine_lut);
   free(pcm_buf);
   free(i2s_buf);
+  free(i2s_resample_buf);
   free(i2s_ring);
   free(tx_frame);
   free(params);
@@ -1818,11 +1948,13 @@ void avb_stream_out_print_diag(void) {
   static uint32_t last_z = 0, last_nz = 0, last_skip = 0;
   static uint32_t last_resync = 0;
   static uint32_t last_full = 0, last_low = 0, last_high = 0;
+  static uint32_t last_drop = 0, last_insert = 0;
   static bool prev_active = false;
   if (!prev_active) {
     last_pkts = last_fail = last_over = 0;
     last_z = last_nz = last_skip = last_resync = 0;
     last_full = last_low = last_high = 0;
+    last_drop = last_insert = 0;
   }
   prev_active = true;
 
@@ -1834,6 +1966,8 @@ void avb_stream_out_print_diag(void) {
   uint32_t full = ctx->capture_full_count;
   uint32_t low = ctx->capture_low_count;
   uint32_t high = ctx->capture_high_count;
+  uint32_t drop = ctx->capture_drop_count;
+  uint32_t insert = ctx->capture_insert_count;
   uint32_t skip = ctx->pll_skip_count;
   uint32_t resync = ctx->gptp_resync_count;
   int32_t fill_min = ctx->capture_fill_min;
@@ -1884,13 +2018,17 @@ void avb_stream_out_print_diag(void) {
   uint32_t dfull = full - last_full;
   uint32_t dlow = low - last_low;
   uint32_t dhigh = high - last_high;
-  if (dz || dfull || dlow || dhigh) {
+  uint32_t ddrop = drop - last_drop;
+  uint32_t dinsert = insert - last_insert;
+  if (dz || dfull || dlow || dhigh || ddrop || dinsert) {
     avbinfo("  STREAM-OUT-fifo: fill=%ld..%ld/%ld B target=%ld B "
-            "packet=%ld B zero=%lu full=%lu low=%lu high=%lu",
+            "packet=%ld B zero=%lu full=%lu low=%lu high=%lu "
+            "drop=%lu insert=%lu",
             (long)fill_min, (long)fill_max, (long)ring_size,
             (long)ring_target, (long)packet_bytes, (unsigned long)dz,
             (unsigned long)dfull, (unsigned long)dlow,
-            (unsigned long)dhigh);
+            (unsigned long)dhigh, (unsigned long)ddrop,
+            (unsigned long)dinsert);
   }
 
   last_pkts = pkts;
@@ -1901,6 +2039,8 @@ void avb_stream_out_print_diag(void) {
   last_full = full;
   last_low = low;
   last_high = high;
+  last_drop = drop;
+  last_insert = insert;
   last_skip = skip;
   last_resync = resync;
 }
