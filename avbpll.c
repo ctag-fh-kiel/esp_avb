@@ -332,6 +332,21 @@ static int32_t compute_ppm_q16(avb_state_s *state, uint64_t bytes_delta,
   return (int32_t)((byte_error * 1000000LL * (1LL << 16)) / expected);
 }
 
+static bool has_active_talker_stream(avb_state_s *state) {
+  /* The AK4619 ADC and DAC share one MCLK/APLL. If any talker stream is
+   * connected, that clock is feeding the ADC side of an active AVTP source.
+   * Listener PLL recovery must not retune it in the background; doing so
+   * produced delayed talker ringing and 2-3 s stereo pops. */
+  if (!state || !state->config.talker)
+    return false;
+  for (size_t i = 0; i < state->num_output_streams; i++) {
+    const uint8_t *count = state->output_streams[i].connection_count;
+    if (((uint16_t)count[0] << 8) | count[1])
+      return true;
+  }
+  return false;
+}
+
 void avb_pll_print_stats(avb_state_s *state) {
   if (!state)
     return;
@@ -401,8 +416,8 @@ void avb_pll_deinit(void) {
 
 int avb_pll_adjust_talker_trim(avb_state_s *state, int32_t delta_ppm_q16) {
   /* Kept as a low-level helper, but not used by the active talker loop:
-   * retuning AK4619 MCLK during capture caused audible pops/ringing. Live PLL
-   * tracking is intentionally confined to listener/media-clock recovery. */
+   * retuning AK4619 MCLK during capture caused audible pops/ringing. Runtime
+   * MCLK correction is allowed only when no talker stream is connected. */
   /* Clock-source index 1 is the CRF stream input, which owns MCLK recovery.
    * INTERNAL/gPTP mode may still have an audio listener active in duplex use;
    * the shared ADC/DAC APLL then has the same gPTP target in both directions. */
@@ -522,6 +537,23 @@ void avb_pll_tick(avb_state_s *state) {
   if (now_us >= s_pll.next_correction_us &&
       (cumul_ppm_q16 > AVB_PLL_CORRECTION_DEADBAND_Q16 ||
        cumul_ppm_q16 < -AVB_PLL_CORRECTION_DEADBAND_Q16)) {
+    if (has_active_talker_stream(state)) {
+      /* Still measure the listener/media-clock error, but keep the hardware
+       * clock fixed while the talker owns the shared AK4619 MCLK. Resetting
+       * the baseline prevents a huge stale correction from being applied when
+       * the talker later disconnects. */
+      ESP_LOGI(TAG,
+               "MCLK correction suppressed while talker active: cumul=%ld.%02ld ppm",
+               (long)(cumul_ppm_q16 / 65536),
+               (long)((cumul_ppm_q16 < 0 ? -cumul_ppm_q16 : cumul_ppm_q16) *
+                      100 / 65536 % 100));
+      s_pll.base_i2s_bytes = bytes_now;
+      s_pll.base_gptp_ns = gptp_now_ns;
+      s_pll.integrator_ppm_q16 = 0;
+      s_pll.next_correction_us = now_us + AVB_PLL_CORRECTION_INTERVAL_US;
+      return;
+    }
+
     /* Accumulate the per-cycle error into the integrator. Random
      * measurement noise averages toward zero over many cycles; any
      * persistent bias drives the integrator toward the value that will
