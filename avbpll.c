@@ -400,6 +400,9 @@ void avb_pll_deinit(void) {
 }
 
 int avb_pll_adjust_talker_trim(avb_state_s *state, int32_t delta_ppm_q16) {
+  /* Kept as a low-level helper, but not used by the active talker loop:
+   * retuning AK4619 MCLK during capture caused audible pops/ringing. Live PLL
+   * tracking is intentionally confined to listener/media-clock recovery. */
   /* Clock-source index 1 is the CRF stream input, which owns MCLK recovery.
    * INTERNAL/gPTP mode may still have an audio listener active in duplex use;
    * the shared ADC/DAC APLL then has the same gPTP target in both directions. */

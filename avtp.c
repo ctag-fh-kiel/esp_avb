@@ -54,6 +54,14 @@ typedef struct {
   volatile int64_t overrun_max_us;   /* worst overrun this session */
   volatile uint32_t i2s_zero_reads;  /* mic ring read returned 0 bytes */
   volatile uint32_t i2s_nonzero_reads; /* healthy mic reads */
+  volatile uint32_t capture_full_count; /* I2S capture ring had no write room */
+  volatile uint32_t capture_low_count;  /* capture ring got near underrun */
+  volatile uint32_t capture_high_count; /* capture ring got near overrun */
+  volatile int32_t capture_fill_min;    /* min capture FIFO fill, bytes */
+  volatile int32_t capture_fill_max;    /* max capture FIFO fill, bytes */
+  volatile int32_t capture_ring_size;   /* capture FIFO capacity, bytes */
+  volatile int32_t capture_ring_target; /* nominal capture FIFO fill, bytes */
+  volatile int32_t capture_packet_bytes; /* bytes consumed per AVTP packet */
   /* TX PLL offset range, cumulative; AVB-STATS resets via print_diag
    * after reading so the reported range is always per-window. */
   volatile int32_t pll_offset_min_ns;
@@ -792,6 +800,8 @@ static void avb_stream_out_task(void *task_param) {
   uint32_t i2s_zero_reads = 0;    /* reads that returned 0 bytes */
   uint32_t i2s_nonzero_audio = 0; /* reads with non-zero audio data */
   uint32_t capture_full_count = 0;
+  uint32_t capture_low_count = 0;
+  uint32_t capture_high_count = 0;
   int capture_fill_min = INT32_MAX;
   int capture_fill_max = 0;
 
@@ -855,12 +865,6 @@ static void avb_stream_out_task(void *task_param) {
     }
     avbinfo("Stream out: I2S ring pre-filled %d bytes", i2s_ring_head);
   }
-  const int32_t talker_trim_step_q16 = 1 * 65536; /* 1 ppm per update */
-  const uint32_t talker_trim_update_packets = 8000; /* 1 s at Class A */
-  const int talker_trim_deadband_packets = 4;
-  const int talker_trim_confirm_windows = 3;
-  int talker_trim_bias = 0;
-
   /* Sample PTP and send-time as late as possible — all logging and pre-fill
    * is done.  This ensures the first packet's presentation timestamp is
    * accurate rather than stale by the pre-fill duration.
@@ -972,6 +976,15 @@ static void avb_stream_out_task(void *task_param) {
         tx_ctx->overrun_max_us = overrun_max;
         tx_ctx->i2s_zero_reads = i2s_zero_reads;
         tx_ctx->i2s_nonzero_reads = i2s_nonzero_audio;
+        tx_ctx->capture_full_count = capture_full_count;
+        tx_ctx->capture_low_count = capture_low_count;
+        tx_ctx->capture_high_count = capture_high_count;
+        tx_ctx->capture_fill_min =
+            capture_fill_min == INT32_MAX ? 0 : capture_fill_min;
+        tx_ctx->capture_fill_max = capture_fill_max;
+        tx_ctx->capture_ring_size = i2s_ring_size;
+        tx_ctx->capture_ring_target = i2s_ring_target;
+        tx_ctx->capture_packet_bytes = i2s_read_size;
         tx_ctx->pll_offset_min_ns = pll_offset_min;
         tx_ctx->pll_offset_max_ns = pll_offset_max;
         tx_ctx->pll_skip_count = pll_skip_count;
@@ -1093,33 +1106,18 @@ static void avb_stream_out_task(void *task_param) {
         capture_fill_min = ring_avail;
       if (ring_avail > capture_fill_max)
         capture_fill_max = ring_avail;
+      if (ring_avail < i2s_read_size)
+        capture_low_count++;
+      if (ring_avail > i2s_ring_size - i2s_read_size)
+        capture_high_count++;
 
-      if (loop_count > 0 &&
-          (loop_count % talker_trim_update_packets) == 0) {
-        int fill_error = ring_avail - i2s_ring_target;
-        if (fill_error > talker_trim_deadband_packets * i2s_read_size) {
-          if (talker_trim_bias > 0)
-            talker_trim_bias++;
-          else
-            talker_trim_bias = 1;
-          if (talker_trim_bias >= talker_trim_confirm_windows) {
-            avb_pll_adjust_talker_trim(state, -talker_trim_step_q16);
-            talker_trim_bias = 0;
-          }
-        } else if (fill_error <
-                   -talker_trim_deadband_packets * i2s_read_size) {
-          if (talker_trim_bias < 0)
-            talker_trim_bias--;
-          else
-            talker_trim_bias = -1;
-          if (talker_trim_bias <= -talker_trim_confirm_windows) {
-            avb_pll_adjust_talker_trim(state, talker_trim_step_q16);
-            talker_trim_bias = 0;
-          }
-        } else {
-          talker_trim_bias = 0;
-        }
-      }
+      /* Do not live-trim the talker APLL here. Retuning MCLK while the AK4619
+       * ADC is actively feeding the AVTP talker produced audible 2-3 s pops
+       * and occasional ringing even with 1 ppm steps. The listener path still
+       * owns live PLL recovery because it must consume an external stream rate;
+       * the talker remains fixed-cadence and only reports FIFO drift via the
+       * sparse STREAM-OUT diagnostics below. */
+
       if (ak4619 && is_am824)
         i2s32_to_am824_channels(i2s_buf, audio_dst,
                                 params->samples_per_packet, i2s_channels,
@@ -1819,10 +1817,12 @@ void avb_stream_out_print_diag(void) {
   static uint32_t last_pkts = 0, last_fail = 0, last_over = 0;
   static uint32_t last_z = 0, last_nz = 0, last_skip = 0;
   static uint32_t last_resync = 0;
+  static uint32_t last_full = 0, last_low = 0, last_high = 0;
   static bool prev_active = false;
   if (!prev_active) {
     last_pkts = last_fail = last_over = 0;
     last_z = last_nz = last_skip = last_resync = 0;
+    last_full = last_low = last_high = 0;
   }
   prev_active = true;
 
@@ -1831,8 +1831,16 @@ void avb_stream_out_print_diag(void) {
   uint32_t over = ctx->overrun_count;
   uint32_t z = ctx->i2s_zero_reads;
   uint32_t nz = ctx->i2s_nonzero_reads;
+  uint32_t full = ctx->capture_full_count;
+  uint32_t low = ctx->capture_low_count;
+  uint32_t high = ctx->capture_high_count;
   uint32_t skip = ctx->pll_skip_count;
   uint32_t resync = ctx->gptp_resync_count;
+  int32_t fill_min = ctx->capture_fill_min;
+  int32_t fill_max = ctx->capture_fill_max;
+  int32_t ring_size = ctx->capture_ring_size;
+  int32_t ring_target = ctx->capture_ring_target;
+  int32_t packet_bytes = ctx->capture_packet_bytes;
   int64_t over_max = ctx->overrun_max_us;
   int32_t pll_min = ctx->pll_offset_min_ns;
   int32_t pll_max = ctx->pll_offset_max_ns;
@@ -1872,12 +1880,27 @@ void avb_stream_out_print_diag(void) {
     avbinfo("  STREAM-OUT-rem: min=%ldns max=%ldns",
             (long)rem_min, (long)rem_max);
   }
+  uint32_t dz = z - last_z;
+  uint32_t dfull = full - last_full;
+  uint32_t dlow = low - last_low;
+  uint32_t dhigh = high - last_high;
+  if (dz || dfull || dlow || dhigh) {
+    avbinfo("  STREAM-OUT-fifo: fill=%ld..%ld/%ld B target=%ld B "
+            "packet=%ld B zero=%lu full=%lu low=%lu high=%lu",
+            (long)fill_min, (long)fill_max, (long)ring_size,
+            (long)ring_target, (long)packet_bytes, (unsigned long)dz,
+            (unsigned long)dfull, (unsigned long)dlow,
+            (unsigned long)dhigh);
+  }
 
   last_pkts = pkts;
   last_fail = fail;
   last_over = over;
   last_z = z;
   last_nz = nz;
+  last_full = full;
+  last_low = low;
+  last_high = high;
   last_skip = skip;
   last_resync = resync;
 }
