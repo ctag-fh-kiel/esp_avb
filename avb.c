@@ -1581,10 +1581,25 @@ _Static_assert(sizeof(avb_persist_input_stream_journal_s) == 32,
 _Static_assert(sizeof(avb_persist_output_stream_journal_s) == 32,
                "output stream journal record must remain 32 bytes");
 
+static esp_err_t avb_persist_write_blob(const avb_persistent_data_s *blob);
+static void avb_persist_gather(avb_state_s *state);
+
 static bool avb_persist_parse_stream_journal_key(const char *key, bool *input,
                                                  uint16_t *index,
                                                  uint32_t *seq) {
-  if (!key || strlen(key) != 9)
+  if (!key)
+    return false;
+  if (strlen(key) == 3 && (strncmp(key, "si", 2) == 0 ||
+                           strncmp(key, "so", 2) == 0)) {
+    *input = key[0] == 's' && key[1] == 'i';
+    char idx_ch = key[2];
+    if (idx_ch < '0' || idx_ch > '7')
+      return false;
+    *index = idx_ch - '0';
+    *seq = UINT32_MAX;
+    return true;
+  }
+  if (strlen(key) != 9)
     return false;
   if (strncmp(key, "si", 2) == 0) {
     *input = true;
@@ -1600,6 +1615,14 @@ static bool avb_persist_parse_stream_journal_key(const char *key, bool *input,
   char *end = NULL;
   *seq = strtoul(&key[3], &end, 16);
   return end && *end == '\0';
+}
+
+static bool avb_persist_is_legacy_stream_journal_key(const char *key) {
+  bool input = false;
+  uint16_t index = 0;
+  uint32_t seq = 0;
+  return key && strlen(key) == 9 &&
+         avb_persist_parse_stream_journal_key(key, &input, &index, &seq);
 }
 
 static void avb_persist_fill_input_stream_record(
@@ -1639,19 +1662,17 @@ static esp_err_t avb_persist_append_stream_record(bool input, uint16_t index,
     return err;
   }
 
-  uint32_t seq = ++s_persist_journal_seq & 0xFFFFFF;
   char key[10];
-  snprintf(key, sizeof(key), "%s%1x%06lx", input ? "si" : "so", index,
-           (unsigned long)seq);
+  snprintf(key, sizeof(key), "%s%1x", input ? "si" : "so", index);
   err = nvs_set_blob(handle, key, record, record_len);
   if (err == ESP_OK) {
     err = nvs_commit(handle);
   }
   nvs_close(handle);
   if (err != ESP_OK) {
-    avberr("NVS: failed to append stream journal %s: %d", key, err);
+    avberr("NVS: failed to update stream journal %s: %d", key, err);
   } else {
-    avbinfo("NVS: appended %s stream journal %s (32 bytes)",
+    avbinfo("NVS: updated %s stream journal %s (32 bytes)",
             input ? "input" : "output", key);
   }
   return err;
@@ -1741,6 +1762,42 @@ static void avb_persist_replay_stream_journal(avb_state_s *state) {
             (unsigned long)s_persist_journal_seq);
   }
   avb_persist_apply(state);
+}
+
+static void avb_persist_compact_legacy_stream_journal(avb_state_s *state) {
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open(AVB_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  if (err != ESP_OK)
+    return;
+
+  int erased = 0;
+  nvs_iterator_t it = NULL;
+  err = nvs_entry_find_in_handle(handle, NVS_TYPE_BLOB, &it);
+  while (err == ESP_OK && it) {
+    nvs_entry_info_t info;
+    if (nvs_entry_info(it, &info) == ESP_OK &&
+        avb_persist_is_legacy_stream_journal_key(info.key)) {
+      if (nvs_erase_key(handle, info.key) == ESP_OK)
+        erased++;
+    }
+    err = nvs_entry_next(&it);
+  }
+  nvs_release_iterator(it);
+
+  if (erased > 0) {
+    err = nvs_commit(handle);
+    if (err == ESP_OK) {
+      avbinfo("NVS: compacted %d legacy stream journal entries", erased);
+    } else {
+      avberr("NVS: failed to compact legacy stream journal: %d", err);
+    }
+  }
+  nvs_close(handle);
+
+  if (erased > 0) {
+    avb_persist_gather(state);
+    avb_persist_write_blob(&state->persist);
+  }
 }
 
 static void avb_persist_gather(avb_state_s *state) {
@@ -1942,6 +1999,7 @@ esp_err_t avb_persist_load(avb_state_s *state) {
     } else {
       avb_persist_apply(state);
       avb_persist_replay_stream_journal(state);
+      avb_persist_compact_legacy_stream_journal(state);
       avbinfo("NVS: loaded persistent data (%d bytes, version %d)",
               (int)stored_size, state->persist.version);
       /* Single post-load summary of any persisted listener bindings.
