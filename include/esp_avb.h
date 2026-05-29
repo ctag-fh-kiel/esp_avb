@@ -155,6 +155,45 @@ typedef struct {
   } entity;
 } avb_status_s;
 
+#define AVB_WEB_MAX_INPUT_STREAMS 2
+#define AVB_WEB_MAX_OUTPUT_STREAMS 2
+
+typedef struct {
+  uint16_t index;
+  bool present;
+  bool connected;
+  bool pending_connection;
+  bool streaming;
+  uint16_t vlan_id;
+  uint16_t connection_count;
+  uint32_t presentation_time_offset_ns;
+  uint8_t stream_id[8];
+  uint8_t stream_dest_addr[6];
+  uint8_t peer_entity_id[8];
+  uint8_t format[8];
+} avb_web_stream_snapshot_s;
+
+typedef struct {
+  bool running;
+  bool talker_enabled;
+  bool listener_enabled;
+  bool clock_source_valid;
+  bool avb_lite;
+  uint16_t active_clock_source_index;
+  int32_t pll_applied_ppm_q16;
+  char entity_name[64];
+  uint8_t entity_id[8];
+  uint8_t gm_id[8];
+  int gm_steps_removed;
+  long peer_delay_ns;
+  long path_delay_ns;
+  long drift_ppb;
+  size_t num_input_streams;
+  size_t num_output_streams;
+  avb_web_stream_snapshot_s input_streams[AVB_WEB_MAX_INPUT_STREAMS];
+  avb_web_stream_snapshot_s output_streams[AVB_WEB_MAX_OUTPUT_STREAMS];
+} avb_web_status_snapshot_s;
+
 /****************************************************************************
  * Public Function Prototypes
  ****************************************************************************/
@@ -190,6 +229,20 @@ int avb_start(avb_config_s *config);
  *       request status simultaneously, some of the requests may timeout.
  */
 int avb_status(avb_status_s *status);
+
+/* @brief Copy a read-only status snapshot for diagnostics / web UI.
+ *
+ * The snapshot is intentionally lightweight and non-blocking: it copies
+ * current AVB state from the control-plane task data structures and does not
+ * perform network or audio operations.
+ */
+int avb_web_status_snapshot(avb_web_status_snapshot_s *snapshot);
+
+/* @brief Set the entity descriptor name and persist it through AVB NVS.
+ *
+ * This is the same name exposed through ATDECC descriptor name index 0.
+ */
+int avb_set_entity_name(const char *name);
 
 /* @brief Stop the AVB task
  *

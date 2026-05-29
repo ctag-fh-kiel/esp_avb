@@ -1131,6 +1131,97 @@ int avb_status(avb_status_s *status) {
   return ret;
 }
 
+static uint16_t avb_be16(const uint8_t v[2]) {
+  return ((uint16_t)v[0] << 8) | v[1];
+}
+
+int avb_web_status_snapshot(avb_web_status_snapshot_s *snapshot) {
+  if (!snapshot)
+    return ERROR;
+  memset(snapshot, 0, sizeof(*snapshot));
+  avb_state_s *state = s_state;
+  if (!state)
+    return ERROR;
+
+  snapshot->running = true;
+  snapshot->talker_enabled = state->config.talker;
+  snapshot->listener_enabled = state->config.listener;
+  snapshot->clock_source_valid = state->ptp_status.clock_source_valid;
+  snapshot->avb_lite = state->avb_lite;
+  snapshot->active_clock_source_index =
+      state->media_clock.active_clock_source_index;
+  snapshot->pll_applied_ppm_q16 = state->media_clock.pll_applied_ppm_q16;
+  snprintf(snapshot->entity_name, sizeof(snapshot->entity_name), "%s",
+           (const char *)state->own_entity.detail.entity_name);
+  memcpy(snapshot->entity_id, state->own_entity.summary.entity_id,
+         sizeof(snapshot->entity_id));
+  memcpy(snapshot->gm_id, state->ptp_status.clock_source_info.gm_id,
+         sizeof(snapshot->gm_id));
+  snapshot->gm_steps_removed = state->ptp_status.clock_source_info.stepsremoved;
+  snapshot->peer_delay_ns = state->ptp_status.peer_delay_ns;
+  snapshot->path_delay_ns = state->ptp_status.path_delay_ns;
+  snapshot->drift_ppb = state->ptp_status.drift_ppb;
+
+  snapshot->num_input_streams = state->num_input_streams;
+  if (snapshot->num_input_streams > AVB_WEB_MAX_INPUT_STREAMS)
+    snapshot->num_input_streams = AVB_WEB_MAX_INPUT_STREAMS;
+  for (size_t i = 0; i < snapshot->num_input_streams; i++) {
+    avb_listener_stream_s *src = &state->input_streams[i];
+    avb_web_stream_snapshot_s *dst = &snapshot->input_streams[i];
+    dst->index = i;
+    dst->present = true;
+    dst->connected = src->connected;
+    dst->pending_connection = src->pending_connection;
+    dst->vlan_id = avb_be16(src->vlan_id);
+    memcpy(dst->stream_id, src->stream_id, sizeof(dst->stream_id));
+    memcpy(dst->stream_dest_addr, src->stream_dest_addr,
+           sizeof(dst->stream_dest_addr));
+    memcpy(dst->peer_entity_id, src->talker_id, sizeof(dst->peer_entity_id));
+    memcpy(dst->format, &src->stream_format, sizeof(dst->format));
+  }
+
+  snapshot->num_output_streams = state->num_output_streams;
+  if (snapshot->num_output_streams > AVB_WEB_MAX_OUTPUT_STREAMS)
+    snapshot->num_output_streams = AVB_WEB_MAX_OUTPUT_STREAMS;
+  for (size_t i = 0; i < snapshot->num_output_streams; i++) {
+    avb_talker_stream_s *src = &state->output_streams[i];
+    avb_web_stream_snapshot_s *dst = &snapshot->output_streams[i];
+    dst->index = i;
+    dst->present = true;
+    dst->streaming = src->streaming;
+    dst->connection_count = avb_be16(src->connection_count);
+    dst->connected = dst->connection_count > 0;
+    dst->vlan_id = avb_be16(src->vlan_id);
+    dst->presentation_time_offset_ns = src->presentation_time_offset_ns;
+    memcpy(dst->stream_id, src->stream_id, sizeof(dst->stream_id));
+    memcpy(dst->stream_dest_addr, src->stream_dest_addr,
+           sizeof(dst->stream_dest_addr));
+    memcpy(dst->format, &src->stream_format, sizeof(dst->format));
+  }
+  return OK;
+}
+
+int avb_set_entity_name(const char *name) {
+  avb_state_s *state = s_state;
+  if (!state || !name)
+    return ERROR;
+
+  size_t len = strnlen(name, 64);
+  if (len == 0 || len >= 64)
+    return ERROR;
+
+  memset(state->descriptor_names[AVB_NAME_ENTITY], 0,
+         sizeof(state->descriptor_names[AVB_NAME_ENTITY]));
+  memcpy(state->descriptor_names[AVB_NAME_ENTITY], name, len);
+  memset(state->own_entity.detail.entity_name, 0,
+         sizeof(state->own_entity.detail.entity_name));
+  memcpy(state->own_entity.detail.entity_name,
+         state->descriptor_names[AVB_NAME_ENTITY],
+         sizeof(state->own_entity.detail.entity_name));
+  avb_persist_request_save(state);
+  return OK;
+}
+
 /* Stop the AVB task */
 int avb_stop() {
   s_state->stop = true;
